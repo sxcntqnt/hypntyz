@@ -1,0 +1,31 @@
+USe go jet for sql
+
+projection-engine/
+├── main.go
+├── go.mod
+├── internal/
+│   ├── server/
+│   │   ├── http.go
+│   │   └── routes.go
+│   │
+│   ├── sirtebasin/
+│   │   └── client.go
+│   │
+│   ├── features/
+│   │   ├── builder.go
+│   │   └── vector.go
+│   │
+│   ├── attention/
+│   │   ├── engine.go
+│   │   └── model.go
+│   │
+│   ├── ranker/
+│   │   └── ranker.go
+│   │
+│   ├── stream/
+│   │   ├── sse.go
+│   │   └── hub.go
+│   │
+│   └── types/
+│       └── types.go
+└── README.md
