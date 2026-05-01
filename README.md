@@ -1,257 +1,166 @@
-Below is a **technical README** for the missing Projection Engine, written in a way that matches your architecture (Sirtebasin → attention → SSE thinning) and explicitly shows how the Go attention library fits in.
+# Projection Engine (Go + Attention Core)
+
+## Sirtebasin Semantic Thinning Runtime
+
+This is the **runtime guide** for deploying and using the Projection Engine — a high-throughput Go service that converts Sirtebasin vehicle truth streams into **attention-ranked, client-specific projections**. It sits between:
+
+- **Sirtebasin** (truth + query layer)
+- **SSE / WebSocket clients** (UI layer)
+
+and performs real-time **semantic thinning** using a Go-based attention engine.
 
 ---
 
-# Projection Engine (Go)
+## 1. What This System Does
 
-### Real-Time Geospatial Attention & Stream Thinning Layer
+The Projection Engine:
 
-The Projection Engine is the **real-time decision layer** between Sirtebasin (query engine) and client-facing SSE/WebSocket streams.
+- Subscribes to Sirtebasin vehicle deltas
+- Builds per-client query vectors
+- Scores vehicles using Go Attention
+- Filters and ranks results per client
+- Emits only **relevant vehicles**, not raw streams
 
-It transforms raw geospatial vehicle data into a **ranked, attention-scored, client-specific projection of reality**.
+Instead of sending 100,000 vehicles:
 
----
-
-## 1. System Role
-
-The Projection Engine is responsible for:
-
-* Querying Sirtebasin for candidate entities (vehicles)
-* Converting raw telemetry into structured feature vectors
-* Encoding user state into a query vector
-* Applying **Go-based attention mechanisms**
-* Ranking and thinning results per client
-* Emitting a minimal, high-signal SSE stream
-
-It does NOT:
-
-* store raw telemetry
-* replace Sirtebasin
-* perform ingestion
-* expose full dataset to clients
+> it sends ~50–500 meaningful ones per client.
 
 ---
 
-## 2. Architecture Overview
+## 2. Core Concept
 
 ```
-                ┌────────────────────┐
-                │   Sirtebasin       │
-                │ (Query Engine)     │
-                └─────────┬──────────┘
-                          │ candidates (raw vehicles)
-                          ▼
-        ┌──────────────────────────────────┐
-        │     Projection Engine (Go)       │
-        │                                  │
-        │  1. Query Adapter               │
-        │  2. Feature Builder             │
-        │  3. Context Builder             │
-        │  4. Attention Engine (Go lib)   │
-        │  5. Ranker / Thinner            │
-        │  6. SSE Gateway                 │
-        └──────────────┬───────────────────┘
-                       │
-                       ▼
-              Client (Web / Mobile)
+Sirtebasin → Vehicle Stream → Projection Engine → Attention Scoring → Client View
 ```
 
----
-
-## 3. Core Design Principle
-
-> Sirtebasin retrieves reality.
-> Projection Engine decides relevance.
-> Attention mechanism assigns importance.
+You are not consuming raw telemetry. You are consuming a **filtered perception layer**.
 
 ---
 
-## 4. Dependencies
+## 3. Prerequisites
 
-### Go Modules
+### Required
+
+- Go 1.21+
+- Redis (for caching + state)
+- Sirtebasin running (query + stream API)
+
+### Optional
+
+- Jaeger (tracing)
+
+---
+
+## 4. Installation
 
 ```bash
-go get github.com/takara-ai/go-attention/attention
+git clone https://github.com/your-org/projection-engine
+cd projection-engine
+go mod tidy
 ```
-
-Optional:
-
-* `github.com/gorilla/mux` (HTTP API)
-* `github.com/valyala/fasthttp` (high-performance SSE)
-* `github.com/google/uuid`
 
 ---
 
-## 5. Data Flow
+## 5. Configuration
 
-### Step 1 — Client Request
+Create `.env`:
 
-Client connects with viewport + intent:
+```env
+SIRTEBASIN_URL=http://localhost:8080
+REDIS_URL=redis://localhost:6379
+TICK_RATE_HZ=20
+MAX_VEHICLES_PER_CLIENT=500
+MAX_CLIENTS_PER_NODE=10000
+ENABLE_BACKPRESSURE=true
+REGION_ID=nairobi-east
+```
+
+---
+
+## 6. Running the Engine
+
+### Development Mode
+
+```bash
+go run ./main.go
+```
+
+### Production Build
+
+```bash
+go build -o projection-engine ./main.go
+./projection-engine
+```
+
+---
+
+## 7. System Behavior
+
+Once running:
+
+### Step 1 — Tick Loop Starts
+
+The engine runs a deterministic loop:
+
+```
+every 50ms (default 20Hz):
+  pull client states
+  fetch vehicle deltas
+  build query vectors
+  score vehicles
+  apply thinning rules
+  emit SSE batches
+```
+
+---
+
+### Step 2 — Sirtebasin Stream Input
+
+The engine listens for vehicle updates:
+
+```json
+{
+  "vehicle_id": "KAA123B",
+  "lat": -1.2921,
+  "lon": 36.8219,
+  "speed": 72,
+  "heading": 180,
+  "timestamp": 1720000000
+}
+```
+
+---
+
+### Step 3 — Attention Scoring
+
+Each vehicle is converted into a feature vector:
+
+```
+[ position, velocity, heading, anomaly_score, fleet_id ]
+```
+
+Then scored against each client query:
+
+```go
+score := attention.Score(clientQuery, vehicleKey)
+```
+
+---
+
+### Step 4 — Projection Output
+
+Only top-scoring vehicles are sent:
 
 ```json
 {
   "client_id": "abc123",
-  "viewport": {
-    "min_lat": -1.32,
-    "min_lon": 36.75,
-    "max_lat": -1.25,
-    "max_lon": 36.82
-  },
-  "focus": {
-    "lat": -1.28,
-    "lon": 36.78
-  },
-  "zoom": 15
-}
-```
-
----
-
-### Step 2 — Sirtebasin Query
-
-Projection Engine calls Sirtebasin:
-
-```go
-vehicles := sirtebasin.QueryViewport(viewport)
-```
-
-Returns:
-
-```json
-[
-  {
-    "id": "KAA123A",
-    "lat": -1.29,
-    "lon": 36.77,
-    "speed": 42,
-    "heading": 120
-  }
-]
-```
-
----
-
-### Step 3 — Feature Builder
-
-Each vehicle is converted into a **feature vector**:
-
-```go
-type VehicleVector []float64
-```
-
-Example encoding:
-
-```go
-v := VehicleVector{
-    normLat,
-    normLon,
-    speedNorm,
-    sin(heading),
-    cos(heading),
-    distanceToFocus,
-    velocityAlignment,
-    anomalyScore,
-}
-```
-
----
-
-### Step 4 — Query Context Builder
-
-Client state becomes a query vector:
-
-```go
-type QueryVector []float64
-
-q := QueryVector{
-    focusLat,
-    focusLon,
-    zoomLevelNorm,
-    movementDirection,
-}
-```
-
----
-
-## 6. Attention Scoring (Core Engine)
-
-This is where the Go attention library is used.
-
-### Option A — Dot Product Attention
-
-```go
-score, _ := attention.DotProductAttention(q, vehicleMatrix, valueMatrix)
-```
-
----
-
-### Option B — Multi-Head Attention (Recommended)
-
-```go
-config := attention.MultiHeadConfig{
-    NumHeads: 4,
-    DModel:   64,
-    DKey:     16,
-    DValue:   16,
-}
-
-mha, _ := attention.NewMultiHeadAttention(config)
-
-output, _ := mha.Forward(queries, keys, values)
-```
-
----
-
-### Interpretation
-
-Each vehicle receives a **relevance score**:
-
-```
-score = attention(user_state, vehicle_state)
-```
-
-This score represents:
-
-* spatial relevance
-* motion alignment
-* proximity to focus
-* anomaly importance
-* contextual clustering
-
----
-
-## 7. Ranking & Thinning
-
-After scoring:
-
-```go
-sort.Slice(vehicles, func(i, j int) bool {
-    return vehicles[i].Score > vehicles[j].Score
-})
-```
-
-Apply constraints:
-
-* Max per client (e.g. 100–500)
-* Minimum anomaly inclusion (always include critical events)
-* Diversity constraints (avoid spatial clustering collapse)
-
----
-
-## 8. SSE Emission Layer
-
-The engine emits only **attention-selected vehicles**:
-
-```text
-event: vehicles
-data: {
-  "ts": 1710000000,
+  "timestamp": 1720000001,
   "vehicles": [
     {
-      "id": "KAA123A",
+      "id": "KAA123B",
       "lat": -1.29,
-      "lon": 36.77,
-      "score": 0.92
+      "lon": 36.82,
+      "score": 0.94
     }
   ]
 }
@@ -259,158 +168,214 @@ data: {
 
 ---
 
-## 9. Internal Modules
+## 8. Client Connection (SSE)
 
-### 9.1 Sirtebasin Adapter
+Clients connect via:
 
-```go
-type SirtebasinClient interface {
-    QueryViewport(v Viewport) ([]Vehicle, error)
-}
+```
+GET /stream?client_id=abc123
+```
+
+### Example
+
+```javascript
+const es = new EventSource("http://localhost:8080/stream?client_id=abc123");
+es.onmessage = (event) => {
+  const data = JSON.parse(event.data);
+  renderVehicles(data.vehicles);
+};
 ```
 
 ---
 
-### 9.2 Feature Builder
+## 9. Client Subscription Model
 
-Responsible for:
+Clients send initial context:
 
-* normalization
-* geospatial transforms
-* motion encoding
-* anomaly injection
+```json
+POST /subscribe?client_id=abc123
+{
+  "viewport": {
+    "min_lat": -1.30,
+    "max_lat": -1.25,
+    "min_lon": 36.80,
+    "max_lon": 36.85
+  },
+  "focus": {
+    "lat": -1.292,
+    "lon": 36.821
+  },
+  "preferences": {
+    "vehicle_types": ["matatu", "bus"],
+    "anomaly_priority": true
+  },
+  "max_results": 300
+}
+```
+
+This defines the **attention budget**.
 
 ---
 
-### 9.3 Attention Engine
+## 10. Redis State (Internal)
 
-Wraps Go library:
+The engine uses Redis for:
 
-```go
-type AttentionEngine struct {
-    model *attention.MultiHeadAttention
-}
+- vehicle state caching
+- client session state
+- precomputed embeddings
+
+### Keys
+
+```
+vehicle:{id}      → latest state
+client:{id}       → viewport + preferences
+region:{h3}       → spatial grouping
+embedding:{id}    → vector cache
 ```
 
 ---
 
-### 9.4 Ranker
+## 11. Tick Engine Behavior
 
-Applies:
+### Default Rate
 
-* top-k selection
-* diversity filtering
-* anomaly guarantees
+```
+20Hz (50ms ticks)
+```
 
----
+### Adaptive Scaling
 
-### 9.5 SSE Gateway
-
-Handles:
-
-* streaming
-* backpressure
-* batching
-* client disconnect recovery
+| Condition | Behavior               |
+| --------- | ---------------------- |
+| Low load  | Increase tick precision|
+| High load | Reduce tick rate       |
+| Overload  | Drop low-score vehicles|
 
 ---
 
-## 10. Performance Constraints
+## 12. Backpressure System
 
-Designed for:
+When system overload occurs:
 
-* 100k+ vehicles in system
-* 1k–10k concurrent clients
-* <200ms projection latency
+### Step 1 — Reduce Frequency
 
-Key optimizations:
+```
+20Hz → 10Hz → 5Hz
+```
 
-* precomputed feature vectors
-* pooled allocations (Go attention lib)
-* batched Sirtebasin queries
-* goroutine-per-client fanout
-* fixed-size vector operations
+### Step 2 — Reduce Output
 
----
+- drop background vehicles
+- keep anomalies + viewport only
 
-## 11. Scaling Model
+### Step 3 — Cluster Mode
 
-| Component         | Scaling Strategy                 |
-| ----------------- | -------------------------------- |
-| Sirtebasin        | stateless horizontal             |
-| Projection Engine | shard by client_id               |
-| SSE Gateway       | per-node connection pooling      |
-| Attention layer   | CPU-bound, multi-core goroutines |
+Instead of individual vehicles:
+
+```
+send clusters (H3 aggregated cells)
+```
 
 ---
 
-## 12. Failure Modes
+## 13. Attention Engine Usage
 
-### Sirtebasin slow
+This system integrates:
 
-→ fallback to cached candidate set
+```go
+import "github.com/takara-ai/go-attention/attention"
+```
 
-### Attention overload
+### Example scoring:
 
-→ degrade to heuristic scoring
-
-### SSE backpressure
-
-→ drop low-score updates first
-
----
-
-## 13. Key Insight
-
-This system is not:
-
-* a streaming pipeline
-* a database system
-* a visualization layer
-
-It is:
-
-> A real-time attention allocator over geospatial state.
+```go
+score, err := attention.DotProductAttention(
+  clientQueryVector,
+  vehicleKeyMatrix,
+  vehicleValueMatrix,
+)
+```
 
 ---
 
-## 14. Build Instructions
+## 14. Performance Expectations
+
+| Metric          | Target            |
+| --------------- | ----------------- |
+| Tick latency    | < 20ms            |
+| Vehicle scoring | ~100–300ns        |
+| SSE batch build | < 5ms             |
+| Max throughput  | 100k vehicles/sec |
+| Memory allocation | near-zero in hot path |
+
+---
+
+## 15. Running in Production
 
 ```bash
-go mod init projection-engine
-
-go get github.com/takara-ai/go-attention/attention
-
-go run main.go
+REGION_ID=nairobi-east \
+TICK_RATE_HZ=20 \
+ENABLE_BACKPRESSURE=true \
+./projection-engine
 ```
 
 ---
 
-## 15. Future Enhancements
+## 16. Architecture Summary
 
-* Learned attention weights (online tuning)
-* H3-based pre-clustering before scoring
-* Persistent per-client attention state
-* Delta-based SSE updates
-* Multi-region projection shards
-
----
-
-## 16. Summary
-
-The Projection Engine is the **missing cognitive layer** in the system:
-
-* Sirtebasin = retrieval
-* Go attention = scoring intelligence
-* Projection Engine = decision runtime
-* SSE = delivery
+```
+Sirtebasin
+  ↓
+Vehicle Stream (truth layer)
+  ↓
+Projection Engine (THIS SYSTEM)
+  ↓
+Go Attention Scoring Layer
+  ↓
+Policy + Backpressure Layer
+  ↓
+SSE / WebSocket Clients
+```
 
 ---
 
-If you want next step, I can turn this into:
+## 17. Mental Model
 
-* a full Go project skeleton (`main.go`, packages, interfaces)
-* or a production-ready deployment design (K8s + sharding + scaling rules)
-* or optimize the attention path for 100k vehicles/sec throughput
+This system is NOT:
 
-Just tell me.
+- a database
+- a stream processor
+- a map renderer
+
+It IS:
+
+> a real-time **attention filter over geospatial reality**
+
+---
+
+## 18. Troubleshooting
+
+### High latency
+
+- reduce tick rate
+- enable Redis caching
+- check Sirtebasin query latency
+
+### Too many vehicles sent
+
+- lower MAX_VEHICLES_PER_CLIENT
+- increase scoring threshold
+
+### Missing updates
+
+- check backpressure mode
+- verify Sirtebasin stream health
+
+---
+
+## 19. Final Note
+
+If Sirtebasin is **truth**, then this engine is **perception control**.
+
+It does not store reality. It decides what reality the user is allowed to see in real time.

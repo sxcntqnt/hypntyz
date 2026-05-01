@@ -1,25 +1,129 @@
 package attention
 
-import takara "github.com/takara-ai/go-attention/attention"
+import (
+	"github.com/takara-ai/go-attention/attention"
 
-// Score vehicles against query
-func (e *Engine) Score(query takara.Vector, keys takara.Matrix) []float64 {
+	"hypnotz/internal/features"
+	"hypnotz/internal/types"
+)
 
-	values := keys // self-attention style
+type Engine struct {
+	model      *AttentionModel
+	vectorPool *features.VectorPool
+	config     AttentionConfig
+}
 
-	output, _ := e.model.Forward(keys, keys, values)
-
-	_ = query // (can be fused later in advanced version)
-
-	scores := make([]float64, len(output))
-
-	for i := range output {
-		sum := 0.0
-		for _, v := range output[i] {
-			sum += v
-		}
-		scores[i] = sum
+func NewEngine(cfg AttentionConfig, pool *features.VectorPool) *Engine {
+	model, err := NewAttentionModel(cfg)
+	if err != nil {
+		return nil
 	}
 
+	return &Engine{
+		model:      model,
+		vectorPool: pool,
+		config:     cfg,
+	}
+}
+
+func (e *Engine) ScoreVehicle(vehicle types.Vehicle, focusLat, focusLon float64) float64 {
+	builder := features.NewBuilder(e.vectorPool)
+	fv := builder.Build(vehicle, focusLat, focusLon)
+
+	key := e.vectorPool.Get()
+	key[0] = fv.Lat
+	key[1] = fv.Lon
+	key[2] = fv.Velocity
+	key[3] = fv.SinHeading
+	key[4] = fv.CosHeading
+	key[5] = fv.Distance
+	key[6] = fv.AnomalyScore
+
+	query := make(attention.Vector, 7)
+	query[0] = focusLat
+	query[1] = focusLon
+	query[2] = 1.0
+	query[3] = 0.0
+	query[4] = 0.0
+	query[5] = 0.0
+	query[6] = 0.0
+
+	keys := attention.Matrix{key}
+	values := attention.Matrix{key}
+
+	_, weights, err := e.model.Score(query, keys, values)
+	if err != nil {
+		return 0.0
+	}
+
+	score := 0.0
+	if len(weights) > 0 {
+		score = weights[0]
+	}
+
+	if fv.AnomalyScore > 0.5 {
+		score += 0.2
+		if score > 1.0 {
+			score = 1.0
+		}
+	}
+
+	return score
+}
+
+func (e *Engine) ScoreBatch(vehicles []types.Vehicle, focusLat, focusLon float64) []float64 {
+	scores := make([]float64, len(vehicles))
+	for i, v := range vehicles {
+		scores[i] = e.ScoreVehicle(v, focusLat, focusLon)
+	}
 	return scores
+}
+
+func (e *Engine) BuildClientQuery(client types.ClientState) attention.Vector {
+	query := make(attention.Vector, 7)
+	query[0] = client.FocusLat
+	query[1] = client.FocusLon
+
+	viewportSize := (client.Viewport.MaxLat - client.Viewport.MinLat) *
+		(client.Viewport.MaxLon - client.Viewport.MinLon)
+	query[2] = 1.0 / (viewportSize + 0.001)
+
+	if client.Preferences.AnomalyPriority {
+		query[3] = 1.0
+	}
+
+	return query
+}
+
+func (e *Engine) ProcessTensorSequence(seq types.TensorSequence) (attention.Matrix, error) {
+	if len(seq.Tokens) == 0 {
+		return attention.Matrix{}, nil
+	}
+
+	query := make(attention.Matrix, 1)
+	query[0] = make(attention.Vector, len(seq.Tokens[0]))
+	for i, val := range seq.Tokens[0] {
+		query[0][i] = val
+	}
+
+	keys := make(attention.Matrix, len(seq.Tokens))
+	for i, token := range seq.Tokens {
+		keys[i] = make(attention.Vector, len(token))
+		for j, val := range token {
+			keys[i][j] = val
+		}
+	}
+
+	values := keys
+
+	output, err := e.model.Forward(query, keys, values)
+	if err != nil {
+		return nil, err
+	}
+
+	return output, nil
+}
+
+func (e *Engine) GetModel() *AttentionModel {
+	return e.model
 }
