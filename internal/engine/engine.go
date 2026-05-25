@@ -7,6 +7,7 @@ import (
 	"hypnotz/internal/attention"
 	"hypnotz/internal/compiler"
 	"hypnotz/internal/features"
+	"hypnotz/internal/memory"
 	"hypnotz/internal/ranker"
 	"hypnotz/internal/sirtebasin"
 	"hypnotz/internal/types"
@@ -20,6 +21,7 @@ type ProjectionEngine struct {
 	attentionEng *attention.Engine
 	rank         *ranker.Ranker
 	vectorPool   *features.VectorPool
+	memoryStore  *memory.MemoryStore
 	config       EngineConfig
 }
 
@@ -35,6 +37,8 @@ type EngineConfig struct {
 	WindowSizeNS         int64
 	SlideNS              int64
 	AllowedLatenessNS    int64
+	MaxMemoryEntities    int
+	MemoryEntityTTL      time.Duration
 }
 
 func DefaultEngineConfig() EngineConfig {
@@ -47,15 +51,17 @@ func DefaultEngineConfig() EngineConfig {
 		WindowSizeNS:         60 * int64(time.Second),
 		SlideNS:              30 * int64(time.Second),
 		AllowedLatenessNS:    5 * int64(time.Second),
+		MaxMemoryEntities:    100000,
+		MemoryEntityTTL:      30 * time.Minute,
 	}
 }
 
 func NewProjectionEngine(cfg EngineConfig) (*ProjectionEngine, error) {
 	adapterCfg := sirtebasin.AdapterConfig{
-		ClickHouseTimeout: 200 * time.Millisecond,
+		ClickHouseTimeout:  200 * time.Millisecond,
 		StabilityThreshold: 5 * time.Minute,
-		RedisURL:          cfg.RedisURL,
-		ClickHouseHost:    cfg.ClickHouseHost,
+		RedisURL:           cfg.RedisURL,
+		ClickHouseHost:     cfg.ClickHouseHost,
 	}
 
 	adapter, err := sirtebasin.NewAdapter(adapterCfg)
@@ -75,6 +81,11 @@ func NewProjectionEngine(cfg EngineConfig) (*ProjectionEngine, error) {
 	tsc := compiler.NewTemporalSequenceCompiler()
 	rank := ranker.NewRanker(cfg.MaxVehiclesPerClient)
 
+	memCfg := memory.DefaultMemoryConfig()
+	memCfg.MaxEntities = cfg.MaxMemoryEntities
+	memCfg.EntityTTL = cfg.MemoryEntityTTL
+	memStore := memory.NewStore(memCfg)
+
 	return &ProjectionEngine{
 		adapter:      adapter,
 		windowing:    window.NewWindowingEngine(windowPolicy),
@@ -82,6 +93,7 @@ func NewProjectionEngine(cfg EngineConfig) (*ProjectionEngine, error) {
 		attentionEng: attentionEng,
 		rank:         rank,
 		vectorPool:   vectorPool,
+		memoryStore:  memStore,
 		config:       cfg,
 	}, nil
 }
@@ -132,21 +144,27 @@ func (pe *ProjectionEngine) ProcessTick(ctx context.Context, clientState types.C
 			continue
 		}
 
-		scores := pe.scoreFromSequence(seq, clientState)
+		entity, err := pe.memoryStore.ApplySequence(seq)
+		if err != nil {
+			continue
+		}
 
-		for i, state := range w.States {
+		entities := []*memory.MemoryEntity{entity}
+		scores := pe.attentionEng.QueryMemory(clientState, entities)
+
+		for i, e := range entities {
 			score := 0.0
 			if i < len(scores) {
 				score = scores[i]
 			}
 
 			proj := types.Projection{
-				ID:        state.VehicleID,
-				Lat:       state.Lat,
-				Lon:       state.Lon,
+				ID:        e.ID,
+				Lat:       e.Position.Lat,
+				Lon:       e.Position.Lon,
 				Score:     score,
-				Speed:     state.Speed,
-				Timestamp: state.TimestampNS,
+				Speed:     e.Velocity.Speed,
+				Timestamp: e.LastSeen.UnixNano(),
 			}
 			allProjections = append(allProjections, proj)
 		}
@@ -200,5 +218,18 @@ func (pe *ProjectionEngine) GetWindowStats() (active, finalized int) {
 func (pe *ProjectionEngine) Reset() {
 	if pe.windowing != nil {
 		pe.windowing.Reset()
+	}
+	if pe.memoryStore != nil {
+		pe.memoryStore.Reset()
+	}
+}
+
+func (pe *ProjectionEngine) GetMemoryStore() *memory.MemoryStore {
+	return pe.memoryStore
+}
+
+func (pe *ProjectionEngine) Stop() {
+	if pe.memoryStore != nil {
+		pe.memoryStore.Stop()
 	}
 }

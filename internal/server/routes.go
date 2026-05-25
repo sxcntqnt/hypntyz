@@ -24,7 +24,8 @@ func (s *Server) health(w http.ResponseWriter, r *http.Request) {
 
 func (s *Server) stats(w http.ResponseWriter, r *http.Request) {
 	w.Header().Set("Content-Type", "application/json")
-	json.NewEncoder(w).Encode(map[string]interface{}{
+	
+	stats := map[string]interface{}{
 		"clients":       s.streamHub.ClientCount(),
 		"tick_rate_hz":  s.config.TickRateHz,
 		"region":        s.config.RegionID,
@@ -32,7 +33,18 @@ func (s *Server) stats(w http.ResponseWriter, r *http.Request) {
 		"max_vehicles":  s.config.MaxVehiclesPerClient,
 		"max_clients":   s.config.MaxClientsPerNode,
 		"timestamp":     time.Now().Unix(),
-	})
+	}
+
+	if s.projEngine != nil {
+		memStore := s.projEngine.GetMemoryStore()
+		if memStore != nil {
+			stats["memory_entities"] = memStore.Count()
+			stats["memory_active"] = len(memStore.GetActiveEntities())
+			stats["memory_stale"] = len(memStore.GetStaleEntities())
+		}
+	}
+
+	json.NewEncoder(w).Encode(stats)
 }
 
 func (s *Server) handleSSE(w http.ResponseWriter, r *http.Request) {

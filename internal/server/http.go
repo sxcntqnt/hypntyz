@@ -130,6 +130,10 @@ func (s *Server) Shutdown(ctx context.Context) error {
 	close(s.tickStop)
 	s.tickWg.Wait()
 
+	if s.projEngine != nil {
+		s.projEngine.Stop()
+	}
+
 	if s.httpServer != nil {
 		return s.httpServer.Shutdown(ctx)
 	}
