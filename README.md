@@ -1,4 +1,4 @@
-# Projection Engine - Cognitive Realtime System
+# Projection Engine - Cognitive Realtime System with Traffic Modeling
 
 ## Architecture Overview
 
@@ -38,7 +38,7 @@
 └─────────────────────────────────────────────────────────────┘
                             ↓
 ┌─────────────────────────────────────────────────────────────┐
-│              MEMORY ENGINE (NEW!)                           │
+│           MEMORY ENGINE + TRAFFIC MODELING                  │
 │  ┌──────────────────────────────────────────────────────┐  │
 │  │  MemoryEntity with persistent state:                 │  │
 │  │  • Position, velocity, trajectory                    │  │
@@ -46,10 +46,17 @@
 │  │  • Embedding (latent representation)                 │  │
 │  │  • Attention history                                 │  │
 │  │  • Predictive state                                  │  │
+│  │                                                      │  │
+│  │  TRAFFIC MODELING (NEW!)                             │  │
+│  │  • TripLine crossing detection                       │  │
+│  │  • Speed sample generation                           │  │
+│  │  • Per-segment speed histograms                      │  │
+│  │  • Anomaly detection via speed deviation             │  │
 │  └──────────────────────────────────────────────────────┘  │
 │                                                             │
 │  Operations:                                                │
 │  • Upsert(event) → evolve entity state                     │
+│  • ProcessTrafficCrossing() → detect speed anomalies       │
 │  • Decay() → gradual salience fade                         │
 │  • Query(client) → retrieve relevant entities              │
 │  • GarbageCollect() → remove stale entities                │
@@ -61,7 +68,7 @@
 │  - Combines:                                                │
 │    • Geometric relevance (60%)                              │
 │    • Entity salience (40%)                                  │
-│    • Anomaly boost                                          │
+│    • Traffic anomaly boost                                  │
 │  - Records attention history per entity                     │
 └─────────────────────────────────────────────────────────────┘
                             ↓
@@ -78,7 +85,7 @@
 └─────────────────────────────────────────────────────────────┘
 ```
 
-## Key Innovation: Memory System
+## Key Innovation: Memory + Traffic System
 
 ### Before (Stateless)
 ```
@@ -86,45 +93,45 @@ event → score → emit → discard
 ```
 Every tick recomputes from scratch. No continuity.
 
-### After (Cognitive)
+### After (Cognitive + Traffic Modeling)
 ```
-event → memory.update() → attention.query() → emit
-            ↓
-    Persistent entity state
-    • Trajectory tracking
-    • Salience accumulation
-    • Anomaly persistence
-    • Embedding evolution
+event → memory.update() → traffic.crossing() → attention.query() → emit
+            ↓                      ↓
+    Persistent entity      Speed samples
+    Trajectory tracking    Histogram aggregation
+    Salience accumulation  Anomaly detection
+    Embedding evolution    Risk score boost
 ```
 
-## Memory Entity Structure
+## Traffic Modeling Details
 
+Inspired by the OpenTraffic traffic-engine (Java), but implemented **in-memory** and **real-time**:
+
+### TripLine System
+- Virtual perpendicular lines across road segments
+- Entry (index=1) and Exit (index=2) pairs
+- Line-intersection math for crossing detection
+- Speed computed from crossing time delta
+
+### Speed Histogram
+- Bucketed by hour-of-week (0-167) and speed bin (0-120 km/h)
+- Compact `uint16` packing: `bin = hour * 120 + speed_bin`
+- Running statistics: count, mean, stddev
+- Anomaly detection: deviation from expected speed
+
+### MemoryEntity Integration
 ```go
-type MemoryEntity struct {
-    ID string
-    
-    // Current state
-    Position  Position
-    Velocity  Velocity
-    
-    // Temporal memory
-    Trajectory    []Position
-    LastSeen      time.Time
-    SeenCount     int
-    
-    // Attention
-    Salience       float64
-    RiskScore      float64
-    AnomalyCount   int
-    AttentionHistory []float64
-    
-    // Semantic
-    Embedding Vector
-    Classification string
-    
-    // Predictive
-    PredictedPath []Position
-}
+entity.ProcessTrafficCrossing(crossing)
+  ↓
+SpeedSample generated
+  ↓
+Added to histogram
+  ↓
+If speed > 1.5x expected OR < 0.5x expected:
+  RiskScore += 0.2
+  Salience += 0.1
+  ↓
+Attention score boosted
 ```
 
 ## Configuration
@@ -133,6 +140,10 @@ type MemoryEntity struct {
 # Memory settings
 MAX_MEMORY_ENTITIES=100000
 MEMORY_ENTITY_TTL=30m
+
+# Traffic modeling
+MAX_SPEED=31.0 m/s  # Filter unrealistic speeds
+MIN_SEGMENT_LEN=60m  # Minimum segment length for trip lines
 
 # Decay settings
 DECAY_RATE=0.995
@@ -146,7 +157,7 @@ DECAY_INTERVAL=1s
 curl http://localhost:8080/health
 ```
 
-### Stats (includes memory metrics)
+### Stats (includes memory + traffic metrics)
 ```bash
 curl http://localhost:8080/stats
 # {
@@ -154,6 +165,8 @@ curl http://localhost:8080/stats
 #   "memory_entities": 1234,
 #   "memory_active": 987,
 #   "memory_stale": 12,
+#   "traffic_samples": 5678,
+#   "anomalies_detected": 23,
 #   ...
 # }
 ```
@@ -199,6 +212,9 @@ go test ./... -v
 # ✓ Garbage collection
 # ✓ Window determinism
 # ✓ Compiler invariants
+# ✓ Traffic trip line crossing
+# ✓ Speed histogram binning
+# ✓ Speed deviation detection
 ```
 
 ## Architecture Properties
@@ -210,6 +226,7 @@ go test ./... -v
 | **Memory persistence** | Entity state evolves, not recomputed |
 | **Attention over memory** | Scores entities, not raw vehicles |
 | **Predictive cognition** | Trajectory + embedding evolution |
+| **Traffic modeling** | TripLine crossing + speed histograms |
 | **Scalability** | O(events × mutations) not O(clients × vehicles × ticks) |
 
 ## Mental Model
@@ -222,6 +239,7 @@ This is a **persistent realtime cognition engine** that:
 - Learns trajectory patterns
 - Maintains latent embeddings
 - Decays irrelevant memories
+- **Detects traffic anomalies in real-time**
 - Surfaces cognitively relevant entities
 
-The system now has **memory**, **attention**, and the beginnings of **predictive cognition**.
+The system now has **memory**, **attention**, and **traffic-aware cognition**.

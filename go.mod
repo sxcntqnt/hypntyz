@@ -1,6 +1,6 @@
 module hypnotz
 
-go 1.23.4
+go 1.21
 
 replace github.com/takara-ai/go-attention => ./go-attention
 

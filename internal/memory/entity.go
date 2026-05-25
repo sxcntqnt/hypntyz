@@ -4,6 +4,7 @@ import (
 	"math"
 	"time"
 
+	"hypnotz/internal/traffic"
 	"hypnotz/internal/types"
 )
 
@@ -49,6 +50,12 @@ type MemoryEntity struct {
 	// Persistence
 	IsStale     bool
 	DecayRate   float64
+
+	// Traffic modeling
+	SpeedHistogram *traffic.SpeedHistogram
+	PendingCrossings map[int64]*traffic.Crossing // segmentID -> crossing
+	LastSpeedSample *traffic.SpeedSample
+	AverageSegmentSpeed float64 // Expected speed for current segment
 }
 
 const (
@@ -62,20 +69,24 @@ func NewMemoryEntity(id string, event types.VehicleState) *MemoryEntity {
 	now := time.Now()
 
 	entity := &MemoryEntity{
-		ID:              id,
-		Position:        Position{Lat: event.Lat, Lon: event.Lon},
-		Velocity:        Velocity{Speed: event.Speed, Heading: event.Heading},
-		Trajectory:      make([]Position, 0, DefaultTrajectoryMax),
-		TrajectoryMax:   DefaultTrajectoryMax,
-		LastSeen:        now,
-		FirstSeen:       now,
-		SeenCount:       1,
-		AttentionHistory: make([]float64, 0, 10),
-		Salience:        BaseSalience,
-		RiskScore:       0.0,
-		Embedding:       make(types.Vector, 0),
-		DecayRate:       DefaultDecayRate,
-		IsStale:         false,
+		ID:                 id,
+		Position:           Position{Lat: event.Lat, Lon: event.Lon},
+		Velocity:           Velocity{Speed: event.Speed, Heading: event.Heading},
+		Trajectory:         make([]Position, 0, DefaultTrajectoryMax),
+		TrajectoryMax:      DefaultTrajectoryMax,
+		LastSeen:           now,
+		FirstSeen:          now,
+		SeenCount:          1,
+		AttentionHistory:   make([]float64, 0, 10),
+		Salience:           BaseSalience,
+		RiskScore:          0.0,
+		Embedding:          make(types.Vector, 0),
+		DecayRate:          DefaultDecayRate,
+		IsStale:            false,
+		SpeedHistogram:     traffic.NewSpeedHistogram(),
+		PendingCrossings:   make(map[int64]*traffic.Crossing),
+		LastSpeedSample:    nil,
+		AverageSegmentSpeed: 15.0, // Default 15 m/s
 	}
 
 	entity.Trajectory = append(entity.Trajectory, entity.Position)
@@ -208,4 +219,62 @@ func (m *MemoryEntity) IsAnomalous() bool {
 
 func (m *MemoryEntity) GetStaleness() time.Duration {
 	return time.Since(m.LastSeen)
+}
+
+// ProcessTrafficCrossing processes a TripLine crossing and potentially generates a speed sample
+func (m *MemoryEntity) ProcessTrafficCrossing(crossing *traffic.Crossing) *traffic.SpeedSample {
+	// Check if this crossing completes a pending crossing
+	lastCrossing, exists := m.PendingCrossings[crossing.TripLine.SegmentID]
+	
+	if exists {
+		// Verify direction (entry -> exit)
+		if lastCrossing.TripLine.Index < crossing.TripLine.Index {
+			// Compute speed sample
+			sample := traffic.ComputeSpeed(lastCrossing, crossing)
+			
+			if sample != nil {
+				// Add to histogram
+				m.SpeedHistogram.AddSample(sample.Time, sample.Speed)
+				m.LastSpeedSample = sample
+				
+				// Update average segment speed
+				_, mean, _ := m.SpeedHistogram.GetStats()
+				m.AverageSegmentSpeed = mean
+				
+				// Check for anomaly (deviation from expected speed)
+				expected := m.SpeedHistogram.GetExpectedSpeed(0) // Simplified
+				if sample.Speed > expected*1.5 || sample.Speed < expected*0.5 {
+					m.RiskScore += 0.2
+					if m.RiskScore > 1.0 {
+						m.RiskScore = 1.0
+					}
+				}
+			}
+			
+			// Clear pending crossing
+			delete(m.PendingCrossings, crossing.TripLine.SegmentID)
+			return sample
+		}
+	}
+	
+	// Store as pending crossing (entry tripline)
+	if crossing.TripLine.Index == 1 {
+		m.PendingCrossings[crossing.TripLine.SegmentID] = crossing
+	}
+	
+	return nil
+}
+
+// GetSpeedDeviation returns how many standard deviations the current speed is from the mean
+func (m *MemoryEntity) GetSpeedDeviation() float64 {
+	if m.LastSpeedSample == nil {
+		return 0.0
+	}
+	
+	_, mean, stddev := m.SpeedHistogram.GetStats()
+	if stddev == 0 {
+		return 0.0
+	}
+	
+	return (m.LastSpeedSample.Speed - mean) / stddev
 }

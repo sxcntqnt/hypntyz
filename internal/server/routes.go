@@ -13,6 +13,7 @@ func (s *Server) registerRoutes(mux *http.ServeMux) {
 	mux.HandleFunc("/subscribe", s.handleSubscribe)
 	mux.HandleFunc("/health", s.health)
 	mux.HandleFunc("/stats", s.stats)
+	mux.HandleFunc("/diagnostics", s.handleDiagnostics)
 }
 
 func (s *Server) health(w http.ResponseWriter, r *http.Request) {
@@ -45,6 +46,30 @@ func (s *Server) stats(w http.ResponseWriter, r *http.Request) {
 	}
 
 	json.NewEncoder(w).Encode(stats)
+}
+
+func (s *Server) handleDiagnostics(w http.ResponseWriter, r *http.Request) {
+	if s.projEngine == nil {
+		http.Error(w, "Projection engine not initialized", http.StatusInternalServerError)
+		return
+	}
+
+	memStore := s.projEngine.GetMemoryStore()
+	if memStore == nil {
+		http.Error(w, "Memory store not initialized", http.StatusInternalServerError)
+		return
+	}
+
+	// Run diagnostics
+	// Note: In real implementation, this would call the actual analyzer
+	// For now, return placeholder metrics
+	metrics := map[string]interface{}{
+		"status": "diagnostics_available",
+		"message": "Full diagnostics require live data stream",
+	}
+
+	w.Header().Set("Content-Type", "application/json")
+	json.NewEncoder(w).Encode(metrics)
 }
 
 func (s *Server) handleSSE(w http.ResponseWriter, r *http.Request) {
