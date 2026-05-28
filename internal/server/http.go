@@ -16,22 +16,24 @@ import (
 	"hypnotz/internal/features"
 	"hypnotz/internal/ranker"
 	"hypnotz/internal/sirtebasin"
+	"hypnotz/internal/traffic"
 	stream2 "hypnotz/internal/stream"
 	"hypnotz/internal/types"
 )
 
 type Server struct {
-	httpServer    *http.Server
-	streamHub     *stream2.Hub
-	attentionEng  *attention.Engine
+	httpServer *http.Server
+	streamHub *stream2.Hub
+	attentionEng *attention.Engine
 	sirtebasinCli *sirtebasin.Client
-	projEngine    *engine.ProjectionEngine
-	rank          *ranker.Ranker
-	vectorPool    *features.VectorPool
-	config        types.ClientConfig
-	tickStop      chan struct{}
-	tickWg        sync.WaitGroup
-	scored        []ranker.ScoredVehicle
+	projEngine *engine.ProjectionEngine
+	trafficAPI *traffic.API
+	rank *ranker.Ranker
+	vectorPool *features.VectorPool
+	config types.ClientConfig
+	tickStop chan struct{}
+	tickWg sync.WaitGroup
+	scored []ranker.ScoredVehicle
 }
 
 func NewServer() *Server {
@@ -60,11 +62,24 @@ func NewServer() *Server {
 	streamHub := stream2.NewHub(config.MaxClientsPerNode, config.EnableBackpressure)
 	rank := ranker.NewRanker(config.MaxVehiclesPerClient)
 
+	// Initialize Traffic API with persistence
+	trafficAPI := traffic.NewTrafficAPI(projEngine.GetMemoryStore())
+	
+	// Setup SQLite persistence (optional, creates traffic.db in current dir)
+	persistor, err := traffic.NewPersistor("traffic.db")
+	if err != nil {
+		log.Printf("Warning: Could not initialize traffic persistence: %v", err)
+	} else {
+		trafficAPI.SetPersistor(persistor)
+		log.Println("Traffic persistence enabled (traffic.db)")
+	}
+
 	s := &Server{
 		streamHub:     streamHub,
 		attentionEng:  attentionEng,
 		sirtebasinCli: sirtebasinCli,
 		projEngine:    projEngine,
+		trafficAPI:    trafficAPI,
 		rank:          rank,
 		vectorPool:    vectorPool,
 		config:        config,

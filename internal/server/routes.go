@@ -14,6 +14,10 @@ func (s *Server) registerRoutes(mux *http.ServeMux) {
 	mux.HandleFunc("/health", s.health)
 	mux.HandleFunc("/stats", s.stats)
 	mux.HandleFunc("/diagnostics", s.handleDiagnostics)
+	
+	if s.trafficAPI != nil {
+		s.trafficAPI.RegisterRoutes(mux)
+	}
 }
 
 func (s *Server) health(w http.ResponseWriter, r *http.Request) {
