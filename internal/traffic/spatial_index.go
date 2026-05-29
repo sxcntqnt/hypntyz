@@ -6,103 +6,161 @@ import (
 	"github.com/uber/h3-go/v4"
 )
 
-// SpatialIndex maps H3 hexagons to traffic data
+// SpatialIndex maps H3 hexagons to the segments and vehicles they contain,
+// enabling fast spatial queries without a full table scan.
 type SpatialIndex struct {
-	mu           sync.RWMutex
-	resolution   int // H3 resolution (0-15)
-	hexToSegments map[h3.Index][]int64      // H3 index -> segment IDs
-	segmentToHex  map[int64]h3.Index        // Segment ID -> H3 index
-	hexToVehicles map[h3.Index][]string     // H3 index -> vehicle IDs
+	mu sync.RWMutex
+
+	resolution int // H3 resolution, 0–15; 9 ≈ 0.1 km²
+
+	hexToSegments map[h3.Cell][]int64  // hex → segment IDs contained within
+	segmentToHex  map[int64]h3.Cell    // reverse: segment ID → its hex
+	hexToVehicles map[h3.Cell][]string // hex → vehicle IDs currently inside
+	vehicleToHex  map[string]h3.Cell   // reverse: vehicle ID → its current hex
 }
 
-// NewSpatialIndex creates an H3-based spatial index
+// NewSpatialIndex creates an H3-based spatial index at the given resolution.
+// Resolution 9 (~0.1 km²) is recommended for urban traffic monitoring.
 func NewSpatialIndex(resolution int) *SpatialIndex {
 	return &SpatialIndex{
 		resolution:    resolution,
-		hexToSegments: make(map[h3.Index][]int64),
-		segmentToHex:  make(map[int64]h3.Index),
-		hexToVehicles: make(map[h3.Index][]string),
+		hexToSegments: make(map[h3.Cell][]int64),
+		segmentToHex:  make(map[int64]h3.Cell),
+		hexToVehicles: make(map[h3.Cell][]string),
+		vehicleToHex:  make(map[string]h3.Cell),
 	}
 }
 
-// AddSegment indexes a segment by its centroid's H3 index
+// AddSegment indexes segmentID at the hexagon covering (lat, lon).
+// Calling AddSegment again for the same ID is a no-op if the hex is unchanged.
 func (si *SpatialIndex) AddSegment(segmentID int64, lat, lon float64) {
+	cell := h3.LatLngToCell(h3.LatLng{Lat: lat, Lng: lon}, si.resolution)
+
 	si.mu.Lock()
 	defer si.mu.Unlock()
 
-	h := h3.FromGeo(h3.GeoCoord{Lat: lat, Lng: lon}, si.resolution)
-	si.segmentToHex[segmentID] = h
-	si.hexToSegments[h] = append(si.hexToSegments[h], segmentID)
+	if prev, ok := si.segmentToHex[segmentID]; ok && prev == cell {
+		return // nothing to do
+	}
+	si.segmentToHex[segmentID] = cell
+	si.hexToSegments[cell] = append(si.hexToSegments[cell], segmentID)
 }
 
-// AddVehicle indexes a vehicle by its current position's H3 index
+// AddVehicle moves vehicleID to the hexagon covering (lat, lon).
+// If the vehicle was previously indexed in a different hex, it is removed
+// from that hex in O(1) via the reverse map.
 func (si *SpatialIndex) AddVehicle(vehicleID string, lat, lon float64) {
+	cell := h3.LatLngToCell(h3.LatLng{Lat: lat, Lng: lon}, si.resolution)
+
 	si.mu.Lock()
 	defer si.mu.Unlock()
 
-	h := h3.FromGeo(h3.GeoCoord{Lat: lat, Lng: lon}, si.resolution)
-	
-	// Remove from old hex if exists (simple approach, could optimize)
-	for hex, vehicles := range si.hexToVehicles {
-		for i, v := range vehicles {
-			if v == vehicleID {
-				si.hexToVehicles[hex] = append(vehicles[:i], vehicles[i+1:]...)
-				break
+	if prev, ok := si.vehicleToHex[vehicleID]; ok {
+		if prev == cell {
+			return // already in the right hex
+		}
+		si.removeVehicleFromHex(vehicleID, prev)
+	}
+	si.vehicleToHex[vehicleID] = cell
+	si.hexToVehicles[cell] = append(si.hexToVehicles[cell], vehicleID)
+}
+
+// RemoveVehicle removes a vehicle from the spatial index entirely.
+// Safe to call even if the vehicle was never indexed.
+func (si *SpatialIndex) RemoveVehicle(vehicleID string) {
+	si.mu.Lock()
+	defer si.mu.Unlock()
+	if prev, ok := si.vehicleToHex[vehicleID]; ok {
+		si.removeVehicleFromHex(vehicleID, prev)
+		delete(si.vehicleToHex, vehicleID)
+	}
+}
+
+// removeVehicleFromHex is the unlocked inner helper — caller must hold mu.Lock.
+func (si *SpatialIndex) removeVehicleFromHex(vehicleID string, cell h3.Cell) {
+	list := si.hexToVehicles[cell]
+	for i, v := range list {
+		if v == vehicleID {
+			last := len(list) - 1
+			list[i] = list[last]
+			si.hexToVehicles[cell] = list[:last]
+			return
+		}
+	}
+}
+
+// GetSegmentsInHex returns a snapshot of all segment IDs in cell.
+func (si *SpatialIndex) GetSegmentsInHex(cell h3.Cell) []int64 {
+	si.mu.RLock()
+	defer si.mu.RUnlock()
+	src := si.hexToSegments[cell]
+	if len(src) == 0 {
+		return nil
+	}
+	out := make([]int64, len(src))
+	copy(out, src)
+	return out
+}
+
+// GetVehiclesInHex returns a snapshot of all vehicle IDs in cell.
+func (si *SpatialIndex) GetVehiclesInHex(cell h3.Cell) []string {
+	si.mu.RLock()
+	defer si.mu.RUnlock()
+	src := si.hexToVehicles[cell]
+	if len(src) == 0 {
+		return nil
+	}
+	out := make([]string, len(src))
+	copy(out, src)
+	return out
+}
+
+// CellFromLatLng converts a geographic coordinate to the H3 cell at the
+// index's configured resolution.
+func (si *SpatialIndex) CellFromLatLng(lat, lon float64) h3.Cell {
+	return h3.LatLngToCell(h3.LatLng{Lat: lat, Lng: lon}, si.resolution)
+}
+
+// Neighbors returns the six cells adjacent to cell (the ring-1 disk minus
+// the center). The returned slice always has exactly 6 elements for valid
+// H3 cells at resolutions 1–15.
+func (si *SpatialIndex) Neighbors(cell h3.Cell) []h3.Cell {
+	disk := h3.GridDisk(cell, 1) // center + 6 neighbours = 7
+	out := make([]h3.Cell, 0, 6)
+	for _, c := range disk {
+		if c != cell {
+			out = append(out, c)
+		}
+	}
+	return out
+}
+
+// CellBoundary returns the boundary polygon of cell as a sequence of
+// [lat, lon] pairs suitable for map rendering.
+func (si *SpatialIndex) CellBoundary(cell h3.Cell) [][2]float64 {
+	loop := h3.CellToBoundary(cell)
+	coords := make([][2]float64, len(loop))
+	for i, ll := range loop {
+		coords[i] = [2]float64{ll.Lat, ll.Lng}
+	}
+	return coords
+}
+
+// SegmentsInDisk returns all segment IDs within k rings of cell (inclusive).
+// Useful for fetching context around a point of interest.
+func (si *SpatialIndex) SegmentsInDisk(cell h3.Cell, k int) []int64 {
+	disk := h3.GridDisk(cell, k)
+	si.mu.RLock()
+	defer si.mu.RUnlock()
+	var out []int64
+	seen := make(map[int64]struct{})
+	for _, c := range disk {
+		for _, seg := range si.hexToSegments[c] {
+			if _, dup := seen[seg]; !dup {
+				seen[seg] = struct{}{}
+				out = append(out, seg)
 			}
 		}
 	}
-	
-	si.hexToVehicles[h] = append(si.hexToVehicles[h], vehicleID)
-}
-
-// GetSegmentsInHex returns all segments in a given H3 hexagon
-func (si *SpatialIndex) GetSegmentsInHex(hex h3.Index) []int64 {
-	si.mu.RLock()
-	defer si.mu.RUnlock()
-	return si.hexToSegments[hex]
-}
-
-// GetVehiclesInHex returns all vehicles in a given H3 hexagon
-func (si *SpatialIndex) GetVehiclesInHex(hex h3.Index) []string {
-	si.mu.RLock()
-	defer si.mu.RUnlock()
-	return si.hexToVehicles[hex]
-}
-
-// GetTrafficInArea returns aggregated traffic state for an H3 hexagon and its neighbors
-func (si *SpatialIndex) GetTrafficInArea(hex h3.Index, api *API) TrafficStateResponse {
-	// Get center hex + 1-ring neighbors
-	neighbors := h3.GridDisk(hex, 1) // Returns center + 6 neighbors = 7 hexes
-	
-	allSegments := []int64{}
-	for _, h := range neighbors {
-		allSegments = append(allSegments, si.GetSegmentsInHex(h)...)
-	}
-	
-	// Aggregate traffic state for these segments
-	// (This would query the persistor or in-memory histograms)
-	
-	return TrafficStateResponse{
-		// Populated based on segment data
-	}
-}
-
-// GetHexFromLatLng converts lat/lon to H3 index
-func (si *SpatialIndex) GetHexFromLatLng(lat, lon float64) h3.Index {
-	return h3.FromGeo(h3.GeoCoord{Lat: lat, Lng: lon}, si.resolution)
-}
-
-// GetNeighbors returns the 6 adjacent hexagons
-func (si *SpatialIndex) GetNeighbors(hex h3.Index) []h3.Index {
-	return h3.GridDisk(hex, 1)[1:] // Skip center (index 0)
-}
-
-// GetHexBoundary returns the hexagon boundary as a list of lat/lon
-func (si *SpatialIndex) GetHexBoundary(hex h3.Index) [][2]float64 {
-	boundary := h3.ToGeoBoundary(hex)
-	coords := make([][2]float64, len(boundary))
-	for i, c := range boundary {
-		coords[i] = [2]float64{c.Lat, c.Lng}
-	}
-	return coords
+	return out
 }
