@@ -12,29 +12,28 @@ func TestCompilerDeterminism(t *testing.T) {
 	c := compiler.NewTemporalSequenceCompiler()
 
 	window := []types.VehicleState{
-		{VehicleID: "v1", TimestampNS: 100, Lat: 1.0, Lon: 2.0, Speed: 30.0, Heading: 0.5, Confidence: 0.8, DataSource: types.Redis},
-		{VehicleID: "v1", TimestampNS: 200, Lat: 1.1, Lon: 2.1, Speed: 31.0, Heading: 0.6, Confidence: 0.85, DataSource: types.ClickHouse},
-		{VehicleID: "v1", TimestampNS: 300, Lat: 1.2, Lon: 2.2, Speed: 32.0, Heading: 0.7, Confidence: 0.9, DataSource: types.Merged},
+		{VehicleID: "v1", TimestampNS: 100, Lat: 1.0, Lon: 2.0, Speed: 30.0, Heading: 0.5, Confidence: 0.80, DataSource: types.SourceRedis},
+		{VehicleID: "v1", TimestampNS: 200, Lat: 1.1, Lon: 2.1, Speed: 31.0, Heading: 0.6, Confidence: 0.85, DataSource: types.SourceClickHouse},
+		{VehicleID: "v1", TimestampNS: 300, Lat: 1.2, Lon: 2.2, Speed: 32.0, Heading: 0.7, Confidence: 0.90, DataSource: types.SourceMerged},
 	}
 
 	a, err := c.Compile("v1", window)
 	if err != nil {
 		t.Fatal(err)
 	}
-
 	b, err := c.Compile("v1", window)
 	if err != nil {
 		t.Fatal(err)
 	}
 
 	if len(a.Tokens) != len(b.Tokens) {
-		t.Error("Compiler output should be deterministic")
+		t.Fatal("compiler output should be deterministic: token count mismatch")
 	}
-
 	for i := range a.Tokens {
 		for j := range a.Tokens[i] {
 			if a.Tokens[i][j] != b.Tokens[i][j] {
-				t.Error("Compiler output should be deterministic")
+				t.Errorf("non-deterministic output at token[%d][%d]: %f vs %f",
+					i, j, a.Tokens[i][j], b.Tokens[i][j])
 			}
 		}
 	}
@@ -53,10 +52,10 @@ func TestNoReordering(t *testing.T) {
 	if err != nil {
 		t.Fatal(err)
 	}
-
 	for i := 1; i < len(out.Timestamps); i++ {
 		if out.Timestamps[i] < out.Timestamps[i-1] {
-			t.Error("Compiler should preserve timestamp ordering")
+			t.Errorf("timestamp ordering violated at index %d: %d < %d",
+				i, out.Timestamps[i], out.Timestamps[i-1])
 		}
 	}
 }
@@ -65,18 +64,17 @@ func TestFixedFeatureDim(t *testing.T) {
 	c := compiler.NewTemporalSequenceCompiler()
 
 	window := []types.VehicleState{
-		{VehicleID: "v1", TimestampNS: 100, Lat: 1.0, Lon: 2.0, Speed: 30.0, Heading: 0.5, Confidence: 0.8, DataSource: types.Redis},
-		{VehicleID: "v1", TimestampNS: 200, Lat: 1.1, Lon: 2.1, Speed: 31.0, Heading: 0.6, Confidence: 0.85, DataSource: types.ClickHouse},
+		{VehicleID: "v1", TimestampNS: 100, Lat: 1.0, Lon: 2.0, Speed: 30.0, Heading: 0.5, Confidence: 0.80, DataSource: types.SourceRedis},
+		{VehicleID: "v1", TimestampNS: 200, Lat: 1.1, Lon: 2.1, Speed: 31.0, Heading: 0.6, Confidence: 0.85, DataSource: types.SourceClickHouse},
 	}
 
 	out, err := c.Compile("v1", window)
 	if err != nil {
 		t.Fatal(err)
 	}
-
 	for i, token := range out.Tokens {
-		if len(token) != 7 {
-			t.Errorf("Token %d has wrong dimension: %d", i, len(token))
+		if len(token) != types.FeatureDim {
+			t.Errorf("token[%d] has wrong dimension: got %d, want %d", i, len(token), types.FeatureDim)
 		}
 	}
 }
@@ -94,10 +92,10 @@ func TestConfidencePassthrough(t *testing.T) {
 	if err != nil {
 		t.Fatal(err)
 	}
-
 	for i := range window {
 		if math.Abs(out.Confidence[i]-window[i].Confidence) > 1e-9 {
-			t.Errorf("Confidence not preserved: expected %f, got %f", window[i].Confidence, out.Confidence[i])
+			t.Errorf("confidence not preserved at index %d: expected %f, got %f",
+				i, window[i].Confidence, out.Confidence[i])
 		}
 	}
 }
@@ -109,13 +107,11 @@ func TestEmptyWindow(t *testing.T) {
 	if err != nil {
 		t.Fatal(err)
 	}
-
 	if len(out.Tokens) != 0 {
-		t.Error("Empty window should produce empty tokens")
+		t.Errorf("empty window should produce 0 tokens, got %d", len(out.Tokens))
 	}
-
 	if !out.IsTimeSorted {
-		t.Error("Empty window should be marked as sorted")
+		t.Error("empty window should be marked as time-sorted")
 	}
 }
 
@@ -123,9 +119,9 @@ func TestSourceEncoding(t *testing.T) {
 	c := compiler.NewTemporalSequenceCompiler()
 
 	window := []types.VehicleState{
-		{VehicleID: "v1", TimestampNS: 100, DataSource: types.Redis},
-		{VehicleID: "v1", TimestampNS: 200, DataSource: types.ClickHouse},
-		{VehicleID: "v1", TimestampNS: 300, DataSource: types.Merged},
+		{VehicleID: "v1", TimestampNS: 100, DataSource: types.SourceRedis},
+		{VehicleID: "v1", TimestampNS: 200, DataSource: types.SourceClickHouse},
+		{VehicleID: "v1", TimestampNS: 300, DataSource: types.SourceMerged},
 	}
 
 	out, err := c.Compile("v1", window)
@@ -133,10 +129,12 @@ func TestSourceEncoding(t *testing.T) {
 		t.Fatal(err)
 	}
 
+	// Feature index 6 carries the source encoding.
 	expected := []float64{1.0, 2.0, 1.5}
 	for i, exp := range expected {
-		if out.Tokens[i][6] != exp {
-			t.Errorf("Source encoding mismatch: expected %f, got %f", exp, out.Tokens[i][6])
+		got := out.Tokens[i][6]
+		if got != exp {
+			t.Errorf("source encoding at token[%d]: expected %f, got %f", i, exp, got)
 		}
 	}
 }
@@ -155,11 +153,25 @@ func TestTimeNormalization(t *testing.T) {
 		t.Fatal(err)
 	}
 
+	// Feature index 5 carries the normalised time delta.
 	if out.Tokens[0][5] != 0.0 {
-		t.Error("First token should have time_delta = 0")
+		t.Errorf("first token time_delta: expected 0.0, got %f", out.Tokens[0][5])
+	}
+	if out.Tokens[len(out.Tokens)-1][5] != 1.0 {
+		t.Errorf("last token time_delta: expected 1.0, got %f", out.Tokens[len(out.Tokens)-1][5])
+	}
+}
+
+func TestUnsortedInputReturnsError(t *testing.T) {
+	c := compiler.NewTemporalSequenceCompiler()
+
+	window := []types.VehicleState{
+		{VehicleID: "v1", TimestampNS: 300},
+		{VehicleID: "v1", TimestampNS: 100}, // out of order
 	}
 
-	if out.Tokens[len(out.Tokens)-1][5] != 1.0 {
-		t.Error("Last token should have time_delta = 1")
+	_, err := c.Compile("v1", window)
+	if err == nil {
+		t.Error("expected ErrUnsortedInput, got nil")
 	}
 }

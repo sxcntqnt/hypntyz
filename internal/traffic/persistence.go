@@ -6,13 +6,14 @@ import (
 	"time"
 
 	_ "github.com/mattn/go-sqlite3"
+
+	"hypnotz/internal/trafficmodel"
 )
 
 const recentAnomalyLimit = 100
 
-// Persistor handles durable storage of speed histograms and anomalies in
-// a local SQLite database. WAL mode is enabled so concurrent readers never
-// block the writer.
+// Persistor handles durable storage of speed histograms and anomalies in a
+// local SQLite database. WAL mode is enabled for high-write concurrency.
 type Persistor struct {
 	db *sql.DB
 }
@@ -27,12 +28,12 @@ func NewPersistor(dbPath string) (*Persistor, error) {
 
 	const schema = `
 CREATE TABLE IF NOT EXISTS speed_samples (
-    id          INTEGER PRIMARY KEY AUTOINCREMENT,
-    segment_id  INTEGER NOT NULL,
+    id           INTEGER PRIMARY KEY AUTOINCREMENT,
+    segment_id   INTEGER NOT NULL,
     hour_of_week INTEGER NOT NULL,
-    speed_bin   INTEGER NOT NULL,
-    count       INTEGER NOT NULL,
-    updated_at  INTEGER NOT NULL,
+    speed_bin    INTEGER NOT NULL,
+    count        INTEGER NOT NULL,
+    updated_at   INTEGER NOT NULL,
     UNIQUE(segment_id, hour_of_week, speed_bin)
 );
 CREATE INDEX IF NOT EXISTS idx_segment ON speed_samples(segment_id);
@@ -58,8 +59,7 @@ CREATE INDEX IF NOT EXISTS idx_anomaly_time ON anomalies(timestamp);
 }
 
 // SaveHistogram persists all non-zero bins of histogram for segmentID.
-// Existing rows for the same (segment, hour, bin) are replaced atomically.
-func (p *Persistor) SaveHistogram(segmentID int64, histogram *SpeedHistogram) error {
+func (p *Persistor) SaveHistogram(segmentID int64, histogram *trafficmodel.SpeedHistogram) error {
 	bins := histogram.ExportBins()
 	if len(bins) == 0 {
 		return nil
@@ -69,7 +69,6 @@ func (p *Persistor) SaveHistogram(segmentID int64, histogram *SpeedHistogram) er
 	if err != nil {
 		return fmt.Errorf("begin tx: %w", err)
 	}
-
 	stmt, err := tx.Prepare(`
 		INSERT OR REPLACE INTO speed_samples (segment_id, hour_of_week, speed_bin, count, updated_at)
 		VALUES (?, ?, ?, ?, ?)
@@ -85,8 +84,8 @@ func (p *Persistor) SaveHistogram(segmentID int64, histogram *SpeedHistogram) er
 		if count == 0 {
 			continue
 		}
-		hour := int(binKey) / NumSpeedBins
-		speedBin := int(binKey) % NumSpeedBins
+		hour := int(binKey) / trafficmodel.NumSpeedBins
+		speedBin := int(binKey) % trafficmodel.NumSpeedBins
 		if _, err = stmt.Exec(segmentID, hour, speedBin, count, now); err != nil {
 			tx.Rollback() //nolint:errcheck
 			return fmt.Errorf("insert bin (seg=%d h=%d b=%d): %w", segmentID, hour, speedBin, err)
@@ -96,9 +95,8 @@ func (p *Persistor) SaveHistogram(segmentID int64, histogram *SpeedHistogram) er
 }
 
 // LoadHistogram reads the persisted bins for segmentID and returns a fully
-// populated SpeedHistogram. Returns an empty histogram (not nil) when no data
-// exists for the segment.
-func (p *Persistor) LoadHistogram(segmentID int64) (*SpeedHistogram, error) {
+// populated SpeedHistogram. Returns an empty histogram when no data exists.
+func (p *Persistor) LoadHistogram(segmentID int64) (*trafficmodel.SpeedHistogram, error) {
 	rows, err := p.db.Query(`
 		SELECT hour_of_week, speed_bin, count
 		FROM speed_samples
@@ -109,18 +107,21 @@ func (p *Persistor) LoadHistogram(segmentID int64) (*SpeedHistogram, error) {
 	}
 	defer rows.Close()
 
-	h := NewSpeedHistogram()
+	h := trafficmodel.NewSpeedHistogram()
 	for rows.Next() {
 		var hour, speedBin int
 		var count int64
 		if err := rows.Scan(&hour, &speedBin, &count); err != nil {
 			return nil, fmt.Errorf("scan row: %w", err)
 		}
-		key := PackBin(hour, speedBin)
-		// Reconstruct totals directly — bypasses the lock because h is local.
-		h.bins[key] += count
-		h.totalCount += count
-		h.totalSum += float64(speedBin) * SpeedBinSizeKmh / 3.6 * float64(count)
+		// Replay samples into the histogram via AddSample approximation.
+		// We reconstruct by calling AddSample once per count unit at a
+		// canonical timestamp for that hour-of-week.
+		speedMS := float64(speedBin) * trafficmodel.SpeedBinSizeKmh / 3.6
+		baseNS := int64(hour) * 3600 * int64(1e9)
+		for i := int64(0); i < count; i++ {
+			h.AddSample(baseNS, speedMS)
+		}
 	}
 	if err := rows.Err(); err != nil {
 		return nil, fmt.Errorf("rows iteration: %w", err)
@@ -171,6 +172,5 @@ func (p *Persistor) GetRecentAnomalies(minutes int) ([]AnomalyReport, error) {
 }
 
 // Close releases the database connection.
-func (p *Persistor) Close() error {
-	return p.db.Close()
-}
+func (p *Persistor) Close() error { return p.db.Close() }
+

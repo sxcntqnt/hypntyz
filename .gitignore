@@ -1,3 +1,6 @@
 hypnotz.exe
 projection-engine.exe
 go-attention
+.env
+go.sum
+go.mod

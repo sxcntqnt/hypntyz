@@ -12,14 +12,20 @@ const (
 	FeatureSize   = 7
 )
 
+// Builder constructs FeatureVectors and raw float64 slices from vehicle and
+// client state. It uses a VectorPool to reduce allocations in the hot path.
 type Builder struct {
 	pool *VectorPool
 }
 
+// NewBuilder returns a Builder backed by the given pool.
 func NewBuilder(pool *VectorPool) *Builder {
 	return &Builder{pool: pool}
 }
 
+// Build produces a FeatureVector for v relative to the given focus point.
+// Speed is normalised to [0, 1] against MaxSpeed; heading is decomposed into
+// sin/cos components to avoid angular discontinuity.
 func (b *Builder) Build(v types.Vehicle, focusLat, focusLon float64) types.FeatureVector {
 	dx := v.Lat - focusLat
 	dy := v.Lon - focusLon
@@ -38,10 +44,12 @@ func (b *Builder) Build(v types.Vehicle, focusLat, focusLon float64) types.Featu
 		CosHeading:   math.Cos(v.Heading),
 		Distance:     distance,
 		AnomalyScore: anomalyScore,
-		FleetID:      0,
+		FleetIDHash:  0, // caller should hash v.FleetID via fnv/murmur if needed
 	}
 }
 
+// ToVector writes fv into a pooled []float64 slice and returns it.
+// The caller must return the slice to the pool via pool.Put when done.
 func (b *Builder) ToVector(fv types.FeatureVector) []float64 {
 	vec := b.pool.Get()
 	vec[0] = fv.Lat
@@ -54,6 +62,9 @@ func (b *Builder) ToVector(fv types.FeatureVector) []float64 {
 	return vec
 }
 
+// BuildQueryVector constructs a query vector from a client's viewport and focus
+// position relative to a candidate vehicle. Used by the attention engine to
+// score geometric relevance.
 func (b *Builder) BuildQueryVector(client types.ClientState, vehicle types.Vehicle) []float64 {
 	vec := b.pool.Get()
 
@@ -65,7 +76,6 @@ func (b *Builder) BuildQueryVector(client types.ClientState, vehicle types.Vehic
 		vehicle.Lat <= client.Viewport.MaxLat &&
 		vehicle.Lon >= client.Viewport.MinLon &&
 		vehicle.Lon <= client.Viewport.MaxLon
-
 	viewportWeight := 0.0
 	if inViewport {
 		viewportWeight = 1.0
@@ -87,18 +97,15 @@ func (b *Builder) BuildQueryVector(client types.ClientState, vehicle types.Vehic
 	return vec
 }
 
+// HaversineDistance returns the great-circle distance in kilometres between
+// two geographic points.
 func HaversineDistance(lat1, lon1, lat2, lon2 float64) float64 {
-	toRad := func(deg float64) float64 {
-		return deg * math.Pi / 180.0
-	}
+	toRad := func(deg float64) float64 { return deg * math.Pi / 180.0 }
 
 	dLat := toRad(lat2 - lat1)
 	dLon := toRad(lon2 - lon1)
-
 	a := math.Sin(dLat/2)*math.Sin(dLat/2) +
 		math.Cos(toRad(lat1))*math.Cos(toRad(lat2))*
 			math.Sin(dLon/2)*math.Sin(dLon/2)
-
-	c := 2 * math.Atan2(math.Sqrt(a), math.Sqrt(1-a))
-	return EarthRadiusKm * c
+	return EarthRadiusKm * 2 * math.Atan2(math.Sqrt(a), math.Sqrt(1-a))
 }
