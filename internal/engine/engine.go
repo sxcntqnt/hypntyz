@@ -2,6 +2,7 @@ package engine
 
 import (
 	"context"
+	"log/slog"
 	"time"
 
 	"hypnotz/internal/attention"
@@ -10,21 +11,26 @@ import (
 	"hypnotz/internal/memory"
 	"hypnotz/internal/ranker"
 	"hypnotz/internal/sirtebasin"
+	"hypnotz/internal/spectral"
 	"hypnotz/internal/types"
 	"hypnotz/internal/window"
 )
 
+// ProjectionEngine is the main orchestrator. Each call to ProcessTick drives
+// the full cognitive pipeline for one client at the current moment in time.
 type ProjectionEngine struct {
-	adapter      *sirtebasin.SirtebasinAdapter
-	windowing    *window.WindowingEngine
-	tsc          *compiler.TemporalSequenceCompiler
-	attentionEng *attention.Engine
-	rank         *ranker.Ranker
-	vectorPool   *features.VectorPool
-	memoryStore  *memory.MemoryStore
-	config       EngineConfig
+	adapter          *sirtebasin.SirtebasinAdapter
+	windowing        *window.WindowingEngine
+	tsc              *compiler.TemporalSequenceCompiler
+	spectralCompiler *spectral.SpectralFeatureCompiler // frequency-domain enrichment stage
+	attentionEng     *attention.Engine
+	rank             *ranker.Ranker
+	vectorPool       *features.VectorPool
+	memoryStore      *memory.MemoryStore
+	config           EngineConfig
 }
 
+// EngineConfig holds all tunables for a ProjectionEngine node.
 type EngineConfig struct {
 	TickRateHz           int
 	MaxVehiclesPerClient int
@@ -41,21 +47,24 @@ type EngineConfig struct {
 	MemoryEntityTTL      time.Duration
 }
 
+// DefaultEngineConfig returns safe production defaults.
+// SirtebasinURL, RedisURL, and ClickHouseHost must be set before use.
 func DefaultEngineConfig() EngineConfig {
 	return EngineConfig{
 		TickRateHz:           20,
 		MaxVehiclesPerClient: 500,
-		MaxClientsPerNode:    10000,
+		MaxClientsPerNode:    10_000,
 		EnableBackpressure:   true,
 		RegionID:             "default",
 		WindowSizeNS:         60 * int64(time.Second),
 		SlideNS:              30 * int64(time.Second),
 		AllowedLatenessNS:    5 * int64(time.Second),
-		MaxMemoryEntities:    100000,
+		MaxMemoryEntities:    100_000,
 		MemoryEntityTTL:      30 * time.Minute,
 	}
 }
 
+// NewProjectionEngine constructs and wires the full pipeline.
 func NewProjectionEngine(cfg EngineConfig) (*ProjectionEngine, error) {
 	adapterCfg := sirtebasin.AdapterConfig{
 		ClickHouseTimeout:  200 * time.Millisecond,
@@ -63,7 +72,6 @@ func NewProjectionEngine(cfg EngineConfig) (*ProjectionEngine, error) {
 		RedisURL:           cfg.RedisURL,
 		ClickHouseHost:     cfg.ClickHouseHost,
 	}
-
 	adapter, err := sirtebasin.NewAdapter(adapterCfg)
 	if err != nil {
 		return nil, err
@@ -76,10 +84,6 @@ func NewProjectionEngine(cfg EngineConfig) (*ProjectionEngine, error) {
 	}
 
 	vectorPool := features.NewVectorPool(features.FeatureSize)
-	attentionCfg := attention.DefaultAttentionConfig()
-	attentionEng := attention.NewEngine(attentionCfg, vectorPool)
-	tsc := compiler.NewTemporalSequenceCompiler()
-	rank := ranker.NewRanker(cfg.MaxVehiclesPerClient)
 
 	memCfg := memory.DefaultMemoryConfig()
 	memCfg.MaxEntities = cfg.MaxMemoryEntities
@@ -87,26 +91,38 @@ func NewProjectionEngine(cfg EngineConfig) (*ProjectionEngine, error) {
 	memStore := memory.NewStore(memCfg)
 
 	return &ProjectionEngine{
-		adapter:      adapter,
-		windowing:    window.NewWindowingEngine(windowPolicy),
-		tsc:          tsc,
-		attentionEng: attentionEng,
-		rank:         rank,
-		vectorPool:   vectorPool,
-		memoryStore:  memStore,
-		config:       cfg,
+		adapter:          adapter,
+		windowing:        window.NewWindowingEngine(windowPolicy),
+		tsc:              compiler.NewTemporalSequenceCompiler(),
+		spectralCompiler: spectral.NewDefaultCompiler(),
+		attentionEng:     attention.NewEngine(attention.DefaultAttentionConfig(), vectorPool),
+		rank:             ranker.NewRanker(cfg.MaxVehiclesPerClient),
+		vectorPool:       vectorPool,
+		memoryStore:      memStore,
+		config:           cfg,
 	}, nil
 }
 
+// ProcessTick runs the full cognitive pipeline for clientState and returns
+// the top-K ranked projections for that client.
+//
+// Pipeline stages:
+//
+//	Sirtebasin query
+//	  → Windowing (temporal segmentation)
+//	    → Temporal Sequence Compiler  (VehicleState[] → TensorSequence)
+//	      → Spectral Feature Compiler (TensorSequence → EnrichedSequence)
+//	        → Memory Engine           (entity upsert + spectral profile update)
+//	          → Attention Engine      (geo + salience + spectral scoring)
+//	            → Ranker              (top-K thinning)
 func (pe *ProjectionEngine) ProcessTick(ctx context.Context, clientState types.ClientState) ([]types.Projection, error) {
 	queryReq := types.QueryRequest{
-		QueryID:   clientState.ID,
-		VehicleID: "",
-		TStart:    time.Now().Add(-5 * time.Minute).UnixNano(),
-		TEnd:      time.Now().UnixNano(),
-		Mode:      types.HybridReconcile,
-		FocusLat:  clientState.FocusLat,
-		FocusLon:  clientState.FocusLon,
+		QueryID:  clientState.ID,
+		Mode:     types.HybridReconcile,
+		FocusLat: clientState.FocusLat,
+		FocusLon: clientState.FocusLon,
+		TStart:   time.Now().Add(-5 * time.Minute).UnixNano(),
+		TEnd:     time.Now().UnixNano(),
 		TimeRange: types.TimeRange{
 			Start: time.Now().Add(-5 * time.Minute),
 			End:   time.Now(),
@@ -118,103 +134,98 @@ func (pe *ProjectionEngine) ProcessTick(ctx context.Context, clientState types.C
 		return nil, err
 	}
 
+	// ── Stage 1: Windowing ───────────────────────────────────────────────────
+	now := time.Now().UnixNano()
 	for _, vehicle := range stateSet.Vehicles {
-		event := window.StreamEvent{
+		pe.windowing.Ingest(window.StreamEvent{
 			State:         vehicle,
-			ArrivalTimeNS: time.Now().UnixNano(),
-		}
-		pe.windowing.Ingest(event)
+			ArrivalTimeNS: now,
+		})
 	}
-
-	pe.windowing.AdvanceWatermark(time.Now().UnixNano())
+	pe.windowing.AdvanceWatermark(now)
 
 	windows, err := pe.windowing.Emit()
 	if err != nil {
 		return nil, err
 	}
 
-	allProjections := make([]types.Projection, 0)
+	// ── Stages 2–5: Compile → Spectral → Memory → Score ─────────────────────
+	projections := make([]types.Projection, 0, len(windows))
+
 	for _, w := range windows {
 		if len(w.States) == 0 {
 			continue
 		}
 
+		// Stage 2: Temporal Sequence Compiler
 		seq, err := pe.tsc.Compile(w.VehicleID, w.States)
 		if err != nil {
+			slog.Warn("temporal compile failed",
+				"vehicle", w.VehicleID, "err", err)
 			continue
 		}
 
+		// Stage 3: Memory Engine upsert.
+		// Apply first so the entity's ring buffer and SpectralProfile are
+		// updated with the latest speed sample before the spectral compiler
+		// reads the full history.
 		entity, err := pe.memoryStore.ApplySequence(seq)
-		if err != nil {
+		if err != nil || entity == nil {
+			slog.Warn("memory apply failed",
+				"vehicle", w.VehicleID, "err", err)
 			continue
 		}
 
-		entities := []*memory.MemoryEntity{entity}
-		scores := pe.attentionEng.QueryMemory(clientState, entities)
-
-		for i, e := range entities {
-			score := 0.0
-			if i < len(scores) {
-				score = scores[i]
-			}
-
-			proj := types.Projection{
-				ID:        e.ID,
-				Lat:       e.Position.Lat,
-				Lon:       e.Position.Lon,
-				Score:     score,
-				Speed:     e.Velocity.Speed,
-				Timestamp: e.LastSeen.UnixNano(),
-			}
-			allProjections = append(allProjections, proj)
+		// Stage 4: Spectral Feature Compiler.
+		// Merges entity speed history (ring buffer) with the current
+		// sequence's speed tokens for a cross-tick FFT view.
+		var speedHistory []float64
+		if entity.SpeedHistory != nil && entity.SpeedHistory.Len() > 0 {
+			speedHistory = entity.SpeedHistory.Slice()
 		}
+		enriched := pe.spectralCompiler.Compile(seq, speedHistory)
+		if !enriched.Valid {
+			// Not enough data for a full spectral frame yet.
+			// The entity still has its ring-buffer SpectralProfile which
+			// the attention engine will use.
+			slog.Debug("spectral frame not yet valid",
+				"vehicle", w.VehicleID,
+				"history_samples", len(speedHistory))
+		}
+
+		// Stage 5: Attention scoring.
+		// ScoreEntity reads entity.SpectralProfile.AnomalyScore (updated in
+		// Stage 3) and blends it with geometric relevance and salience.
+		score := pe.attentionEng.ScoreEntity(entity, clientState)
+
+		projections = append(projections, types.Projection{
+			ID:        entity.ID,
+			Lat:       entity.Position.Lat,
+			Lon:       entity.Position.Lon,
+			Score:     score,
+			Speed:     entity.Velocity.Speed,
+			Heading:   entity.Velocity.Heading,
+			Timestamp: entity.LastSeen.UnixNano(),
+		})
 	}
 
-	_ = pe.rank
-
-	return allProjections, nil
+	// ── Stage 6: Ranker — top-K thinning ─────────────────────────────────────
+	return pe.rank.Rank(projections), nil
 }
 
-func (pe *ProjectionEngine) scoreFromSequence(seq types.TensorSequence, clientState types.ClientState) []float64 {
-	scores := make([]float64, len(seq.Tokens))
-
-	for i := range seq.Tokens {
-		lat := seq.Tokens[i][0]
-		lon := seq.Tokens[i][1]
-
-		dx := lat - clientState.FocusLat
-		dy := lon - clientState.FocusLon
-		distance := (dx*dx + dy*dy)
-
-		inViewport := lat >= clientState.Viewport.MinLat &&
-			lat <= clientState.Viewport.MaxLat &&
-			lon >= clientState.Viewport.MinLon &&
-			lon <= clientState.Viewport.MaxLon
-
-		score := 0.5
-		if inViewport {
-			score += 0.3
-		}
-
-		score -= distance * 0.1
-
-		if score > 1.0 {
-			score = 1.0
-		}
-		if score < 0.0 {
-			score = 0.0
-		}
-
-		scores[i] = score
-	}
-
-	return scores
+// GetMemoryStore returns the engine's MemoryStore, used by the traffic API
+// layer and diagnostics.
+func (pe *ProjectionEngine) GetMemoryStore() *memory.MemoryStore {
+	return pe.memoryStore
 }
 
+// GetWindowStats returns active and finalized window counts.
 func (pe *ProjectionEngine) GetWindowStats() (active, finalized int) {
-	return 0, 0
+	return pe.windowing.Stats()
 }
 
+// Reset clears transient engine state (windowing buffers, memory store).
+// The spectral compiler is stateless and does not need resetting.
 func (pe *ProjectionEngine) Reset() {
 	if pe.windowing != nil {
 		pe.windowing.Reset()
@@ -224,10 +235,7 @@ func (pe *ProjectionEngine) Reset() {
 	}
 }
 
-func (pe *ProjectionEngine) GetMemoryStore() *memory.MemoryStore {
-	return pe.memoryStore
-}
-
+// Stop shuts down background goroutines (memory decay loop, etc.).
 func (pe *ProjectionEngine) Stop() {
 	if pe.memoryStore != nil {
 		pe.memoryStore.Stop()
