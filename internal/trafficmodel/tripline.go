@@ -30,11 +30,19 @@ type Crossing struct {
 	VehicleID string
 }
 
-// SpeedSample is a derived speed observation on a road segment.
+// SpeedSample is a derived speed observation on a road segment, computed
+// from a matched entry/exit TripLine pair.
 type SpeedSample struct {
 	SegmentID int64
 	Time      int64   // Unix nanoseconds, taken at the entry crossing
 	Speed     float64 // m/s
+
+	// SpectralDeviationScore is the frequency-domain anomaly score [0, 1]
+	// at the time of this crossing. Populated by the memory layer using the
+	// entity's speed ring buffer; zero when spectral data is unavailable.
+	// A high score (→1) indicates erratic high-frequency speed behaviour
+	// around this crossing event.
+	SpectralDeviationScore float64
 }
 
 const (
@@ -81,6 +89,8 @@ func (tl *TripLine) CheckCrossing(p0, p1 Point, t0, t1 int64) *Crossing {
 // ComputeSpeed derives a SpeedSample from an entry crossing c1 and an exit
 // crossing c2 on the same segment. Returns nil when the inputs are invalid or
 // the implied speed is outside a realistic range.
+// SpectralDeviationScore is left at zero and must be populated by the caller
+// if frequency-domain context is available.
 func ComputeSpeed(c1, c2 *Crossing) *SpeedSample {
 	if c1.TripLine.SegmentID != c2.TripLine.SegmentID {
 		return nil
@@ -104,7 +114,15 @@ func ComputeSpeed(c1, c2 *Crossing) *SpeedSample {
 		SegmentID: c1.TripLine.SegmentID,
 		Time:      c1.Time,
 		Speed:     speed,
+		// SpectralDeviationScore: populated by memory layer after FFT
 	}
+}
+
+// IsSpectrallyAnomalous reports whether a SpeedSample's spectral deviation
+// score exceeds the given threshold. Callers typically use 0.6 as a threshold
+// for triggering a risk-score boost.
+func (s *SpeedSample) IsSpectrallyAnomalous(threshold float64) bool {
+	return s.SpectralDeviationScore > threshold
 }
 
 // ─── Geographic helpers ────────────────────────────────────────────────────────

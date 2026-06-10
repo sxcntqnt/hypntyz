@@ -29,46 +29,43 @@ const (
 	AnomalySalienceBoost = 0.4
 	BaseSalience         = 0.5
 
-	// defaultSegmentSpeedMS is the assumed expected speed before any samples.
-	defaultSegmentSpeedMS = trafficmodel.DefaultExpectedSpeedMS
-
+	defaultSegmentSpeedMS  = trafficmodel.DefaultExpectedSpeedMS
 	anomalyRiskDelta       = 0.2
 	salienceDecayTimeConst = 0.1
+	entropySpikeSigma      = 2.0
 
-	// entropySpikeSigma is the standard-deviation threshold used to declare
-	// an entropy spike in the spectral profile.
-	entropySpikeSigma = 2.0
+	// spectralCrossingThreshold is the SpectralDeviationScore above which a
+	// crossing event triggers an additional risk-score boost.
+	spectralCrossingThreshold = 0.6
+
+	// spectralCrossingRiskDelta is the risk increment applied when a crossing
+	// event has a high spectral deviation score.
+	spectralCrossingRiskDelta = 0.1
 )
 
 // MemoryEntity holds all persistent state for a single tracked vehicle.
 type MemoryEntity struct {
 	ID string
 
-	// Kinematic state.
 	Position Position
 	Velocity Velocity
 
-	// Temporal memory.
 	Trajectory    []Position
 	TrajectoryMax int
 	LastSeen      time.Time
 	FirstSeen     time.Time
 	SeenCount     int
 
-	// Attention / salience.
 	AttentionHistory []float64
 	Salience         float64
 	RiskScore        float64
 
-	// Semantic memory.
 	Embedding      types.Vector
 	Classification string
 
-	// Predictive state.
 	PredictedPath []Position
 	AnomalyCount  int
 
-	// Persistence.
 	IsStale   bool
 	DecayRate float64
 
@@ -79,9 +76,6 @@ type MemoryEntity struct {
 	AverageSegmentSpeed float64
 
 	// Spectral cognition.
-	// SpeedHistory accumulates speed samples for FFT analysis. It is written
-	// during Apply (under MemoryStore's write lock) and read by the spectral
-	// compiler stage after GetAll().
 	SpeedHistory    *spectral.RingBuffer
 	SpectralProfile *spectral.SpectralProfile
 }
@@ -140,13 +134,12 @@ func (m *MemoryEntity) Apply(event types.VehicleState) {
 	m.LastSeen = time.Now()
 	m.SeenCount++
 
-	// Push speed sample into ring buffer and refresh spectral profile.
+	// Push speed sample and refresh spectral profile.
 	m.SpeedHistory.Push(event.Speed)
 	if m.SpeedHistory.Len() >= spectral.DefaultMinSamples {
 		m.updateSpectral()
 	}
 
-	// Low-confidence or merged readings contribute to anomaly signals.
 	isAnomalous := event.DataSource == types.SourceMerged || event.Confidence < 0.3
 	if isAnomalous {
 		m.AnomalyCount++
@@ -154,7 +147,6 @@ func (m *MemoryEntity) Apply(event types.VehicleState) {
 		m.RiskScore = math.Min(m.RiskScore+0.1, 1.0)
 	}
 
-	// If spectral profile shows an entropy spike, boost salience further.
 	if m.SpectralProfile.EntropySpike(entropySpikeSigma) {
 		m.Salience = math.Min(m.Salience+0.15, 1.0)
 	}
@@ -167,30 +159,20 @@ func (m *MemoryEntity) Apply(event types.VehicleState) {
 }
 
 // updateSpectral runs the FFT on the current speed ring buffer and refreshes
-// the SpectralProfile. Called from Apply while the store's write lock is held.
+// SpectralProfile. Called from Apply while the store's write lock is held.
 func (m *MemoryEntity) updateSpectral() {
 	speeds := m.SpeedHistory.Slice()
 	sp := spectral.Compute(speeds, spectral.DefaultSampleRate)
 	m.SpectralProfile.Update(sp, time.Now().UnixNano())
 
-	// Propagate spectral anomaly into risk score.
-	spectralRisk := float64(m.SpectralProfile.AnomalyScore)
-	if spectralRisk > 0.7 {
+	if float64(m.SpectralProfile.AnomalyScore) > 0.7 {
 		m.RiskScore = math.Min(m.RiskScore+0.05, 1.0)
 	}
 }
 
-// Decay reduces salience and risk score by the configured decay rate.
-func (m *MemoryEntity) Decay(dt float64) {
-	factor := math.Pow(m.DecayRate, dt)
-	m.Salience *= factor
-	m.RiskScore *= factor
-	if m.Salience < 0.01 {
-		m.IsStale = true
-	}
-}
-
 // ProcessTrafficCrossing feeds a TripLine crossing into the traffic model.
+// When a matching entry crossing exists, a SpeedSample is computed and its
+// SpectralDeviationScore is populated from the current speed ring buffer.
 func (m *MemoryEntity) ProcessTrafficCrossing(crossing *trafficmodel.Crossing) *trafficmodel.SpeedSample {
 	segID := crossing.TripLine.SegmentID
 	pending, hasPending := m.PendingCrossings[segID]
@@ -198,8 +180,24 @@ func (m *MemoryEntity) ProcessTrafficCrossing(crossing *trafficmodel.Crossing) *
 	if hasPending && pending.TripLine.Index < crossing.TripLine.Index {
 		sample := trafficmodel.ComputeSpeed(pending, crossing)
 		if sample != nil {
+			// Populate spectral deviation score from the current speed window.
+			// This enriches the sample with frequency-domain context at the
+			// moment of the crossing, without requiring trafficmodel to import
+			// the spectral package.
+			if m.SpeedHistory.Len() >= spectral.DefaultMinSamples {
+				speeds := m.SpeedHistory.Slice()
+				sp := spectral.Compute(speeds, spectral.DefaultSampleRate)
+				features := spectral.Extract(sp)
+				sample.SpectralDeviationScore = float64(spectral.ComputeAnomalyScore(features))
+
+				if sample.IsSpectrallyAnomalous(spectralCrossingThreshold) {
+					m.RiskScore = math.Min(m.RiskScore+spectralCrossingRiskDelta, 1.0)
+				}
+			}
+
 			m.SpeedHistogram.AddSample(sample.Time, sample.Speed)
 			m.LastSpeedSample = sample
+
 			_, mean, _ := m.SpeedHistogram.GetStats()
 			m.AverageSegmentSpeed = mean
 
@@ -230,12 +228,19 @@ func (m *MemoryEntity) GetSpeedDeviation() float64 {
 	return (m.LastSpeedSample.Speed - mean) / stddev
 }
 
-// IsAnomalous reports whether this entity has accumulated enough anomaly signals.
 func (m *MemoryEntity) IsAnomalous() bool {
 	return m.AnomalyCount > 2 || m.RiskScore > 0.7
 }
 
-// Predict returns the estimated position after dt using linear velocity.
+func (m *MemoryEntity) Decay(dt float64) {
+	factor := math.Pow(m.DecayRate, dt)
+	m.Salience *= factor
+	m.RiskScore *= factor
+	if m.Salience < 0.01 {
+		m.IsStale = true
+	}
+}
+
 func (m *MemoryEntity) Predict(dt time.Duration) Position {
 	s := dt.Seconds()
 	return Position{

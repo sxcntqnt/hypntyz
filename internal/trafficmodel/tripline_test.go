@@ -1,4 +1,4 @@
-package trafficmodel
+package trafficmodel_test
 
 import (
 	"math"
@@ -8,7 +8,6 @@ import (
 )
 
 func TestLineIntersection(t *testing.T) {
-	// Horizontal segment (p0→p1) crossed by a vertical segment (p2→p3).
 	p0 := trafficmodel.Point{Lat: 0, Lon: 0}
 	p1 := trafficmodel.Point{Lat: 0, Lon: 1}
 	p2 := trafficmodel.Point{Lat: -0.5, Lon: 0.5}
@@ -25,7 +24,6 @@ func TestLineIntersection(t *testing.T) {
 		t.Errorf("expected u=0.5, got %f", uVal)
 	}
 
-	// Parallel lines must not intersect.
 	p4 := trafficmodel.Point{Lat: 0, Lon: 0}
 	p5 := trafficmodel.Point{Lat: 0, Lon: 1}
 	p6 := trafficmodel.Point{Lat: 1, Lon: 0}
@@ -36,7 +34,6 @@ func TestLineIntersection(t *testing.T) {
 }
 
 func TestDistanceMeters(t *testing.T) {
-	// One degree of latitude ≈ 111 km.
 	p1 := trafficmodel.Point{Lat: 0, Lon: 0}
 	p2 := trafficmodel.Point{Lat: 1, Lon: 0}
 	dist := trafficmodel.DistanceMeters(p1, p2)
@@ -81,19 +78,60 @@ func TestCheckCrossing(t *testing.T) {
 
 func TestComputeSpeed(t *testing.T) {
 	p := trafficmodel.Point{Lat: 0, Lon: 0}
-	tl1 := trafficmodel.CreateTripLine(1, 1, 1, 0.0, p, 0.0, 20.0)   // entry
-	tl2 := trafficmodel.CreateTripLine(2, 1, 2, 100.0, p, 0.0, 20.0) // exit, 100 m away
+	tl1 := trafficmodel.CreateTripLine(1, 1, 1, 0.0, p, 0.0, 20.0)
+	tl2 := trafficmodel.CreateTripLine(2, 1, 2, 100.0, p, 0.0, 20.0)
 
 	c1 := &trafficmodel.Crossing{TripLine: tl1, Time: 0}
-	c2 := &trafficmodel.Crossing{TripLine: tl2, Time: 5_000_000_000} // 5 s later
+	c2 := &trafficmodel.Crossing{TripLine: tl2, Time: 5_000_000_000}
 
 	sample := trafficmodel.ComputeSpeed(c1, c2)
 	if sample == nil {
 		t.Fatal("should compute a speed sample")
 	}
-	// 100 m / 5 s = 20 m/s
 	if math.Abs(sample.Speed-20.0) > 0.1 {
 		t.Errorf("expected 20 m/s, got %.2f", sample.Speed)
+	}
+}
+
+func TestSpeedSampleSpectralDeviationDefaultsZero(t *testing.T) {
+	// ComputeSpeed must return a sample with SpectralDeviationScore = 0.
+	// The memory layer is responsible for populating it; trafficmodel must
+	// not assume spectral context is available.
+	p := trafficmodel.Point{Lat: 0, Lon: 0}
+	tl1 := trafficmodel.CreateTripLine(1, 1, 1, 0.0, p, 0.0, 20.0)
+	tl2 := trafficmodel.CreateTripLine(2, 1, 2, 50.0, p, 0.0, 20.0)
+
+	c1 := &trafficmodel.Crossing{TripLine: tl1, Time: 0}
+	c2 := &trafficmodel.Crossing{TripLine: tl2, Time: 2_500_000_000}
+
+	sample := trafficmodel.ComputeSpeed(c1, c2)
+	if sample == nil {
+		t.Fatal("should compute a speed sample")
+	}
+	if sample.SpectralDeviationScore != 0.0 {
+		t.Errorf("SpectralDeviationScore should default to 0, got %f",
+			sample.SpectralDeviationScore)
+	}
+}
+
+func TestIsSpectrallyAnomalous(t *testing.T) {
+	sample := &trafficmodel.SpeedSample{
+		SegmentID:              1,
+		Speed:                  20.0,
+		SpectralDeviationScore: 0.75,
+	}
+	if !sample.IsSpectrallyAnomalous(0.6) {
+		t.Error("score 0.75 should be anomalous above threshold 0.6")
+	}
+	if sample.IsSpectrallyAnomalous(0.8) {
+		t.Error("score 0.75 should not be anomalous above threshold 0.8")
+	}
+}
+
+func TestIsSpectrallyAnomalousZeroScore(t *testing.T) {
+	sample := &trafficmodel.SpeedSample{Speed: 15.0}
+	if sample.IsSpectrallyAnomalous(0.6) {
+		t.Error("zero SpectralDeviationScore should never be anomalous")
 	}
 }
 
@@ -110,7 +148,6 @@ func TestSpeedHistogram(t *testing.T) {
 
 func TestSpeedHistogramBinning(t *testing.T) {
 	h := trafficmodel.NewSpeedHistogram()
-	// Hour 10, speed ≈ 50 km/h (13.89 m/s).
 	h.AddSample(10*3600*int64(1e9), 13.89)
 	key := trafficmodel.PackBin(10, 50)
 	bins := h.ExportBins()
