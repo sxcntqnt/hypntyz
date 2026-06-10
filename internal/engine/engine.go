@@ -22,7 +22,7 @@ type ProjectionEngine struct {
 	adapter          *sirtebasin.SirtebasinAdapter
 	windowing        *window.WindowingEngine
 	tsc              *compiler.TemporalSequenceCompiler
-	spectralCompiler *spectral.SpectralFeatureCompiler // frequency-domain enrichment stage
+	spectralCompiler *spectral.SpectralFeatureCompiler
 	attentionEng     *attention.Engine
 	rank             *ranker.Ranker
 	vectorPool       *features.VectorPool
@@ -109,12 +109,12 @@ func NewProjectionEngine(cfg EngineConfig) (*ProjectionEngine, error) {
 // Pipeline stages:
 //
 //	Sirtebasin query
-//	  → Windowing (temporal segmentation)
-//	    → Temporal Sequence Compiler  (VehicleState[] → TensorSequence)
-//	      → Spectral Feature Compiler (TensorSequence → EnrichedSequence)
-//	        → Memory Engine           (entity upsert + spectral profile update)
-//	          → Attention Engine      (geo + salience + spectral scoring)
-//	            → Ranker              (top-K thinning)
+//	  → Windowing          (temporal segmentation + watermarking)
+//	    → Temporal Compiler (VehicleState[] → TensorSequence)
+//	      → Memory Engine  (entity upsert, ring buffer, SpectralProfile update)
+//	        → Spectral Compiler (TensorSequence + history → EnrichedSequence)
+//	          → Attention  (geo × 0.50 + salience × 0.30 + spectral × 0.20)
+//	            → Ranker   (anomaly promotion + top-K thinning)
 func (pe *ProjectionEngine) ProcessTick(ctx context.Context, clientState types.ClientState) ([]types.Projection, error) {
 	queryReq := types.QueryRequest{
 		QueryID:  clientState.ID,
@@ -136,11 +136,13 @@ func (pe *ProjectionEngine) ProcessTick(ctx context.Context, clientState types.C
 
 	// ── Stage 1: Windowing ───────────────────────────────────────────────────
 	now := time.Now().UnixNano()
-	for _, vehicle := range stateSet.Vehicles {
-		pe.windowing.Ingest(window.StreamEvent{
-			State:         vehicle,
+	for _, v := range stateSet.Vehicles {
+		if err := pe.windowing.Ingest(window.StreamEvent{
+			State:         v,
 			ArrivalTimeNS: now,
-		})
+		}); err != nil {
+			slog.Debug("late event dropped", "vehicle", v.VehicleID, "err", err)
+		}
 	}
 	pe.windowing.AdvanceWatermark(now)
 
@@ -149,82 +151,82 @@ func (pe *ProjectionEngine) ProcessTick(ctx context.Context, clientState types.C
 		return nil, err
 	}
 
-	// ── Stages 2–5: Compile → Spectral → Memory → Score ─────────────────────
-	projections := make([]types.Projection, 0, len(windows))
+	// ── Stages 2–5: per-window compile → memory → spectral → score ──────────
+	vehicles := make([]types.Vehicle, 0, len(windows))
+	scores := make([]float64, 0, len(windows))
 
 	for _, w := range windows {
 		if len(w.States) == 0 {
 			continue
 		}
 
-		// Stage 2: Temporal Sequence Compiler
+		// Stage 2: Temporal Sequence Compiler.
 		seq, err := pe.tsc.Compile(w.VehicleID, w.States)
 		if err != nil {
-			slog.Warn("temporal compile failed",
-				"vehicle", w.VehicleID, "err", err)
+			slog.Warn("temporal compile failed", "vehicle", w.VehicleID, "err", err)
 			continue
 		}
 
 		// Stage 3: Memory Engine upsert.
-		// Apply first so the entity's ring buffer and SpectralProfile are
-		// updated with the latest speed sample before the spectral compiler
-		// reads the full history.
+		// Apply first so entity.SpeedHistory and entity.SpectralProfile are
+		// refreshed with the latest sample before the spectral compiler reads
+		// the full history.
 		entity, err := pe.memoryStore.ApplySequence(seq)
 		if err != nil || entity == nil {
-			slog.Warn("memory apply failed",
-				"vehicle", w.VehicleID, "err", err)
+			slog.Warn("memory apply failed", "vehicle", w.VehicleID, "err", err)
 			continue
 		}
 
 		// Stage 4: Spectral Feature Compiler.
-		// Merges entity speed history (ring buffer) with the current
-		// sequence's speed tokens for a cross-tick FFT view.
+		// Merges entity speed history (ring buffer) with the sequence's
+		// speed tokens for a cross-tick FFT view.
 		var speedHistory []float64
 		if entity.SpeedHistory != nil && entity.SpeedHistory.Len() > 0 {
 			speedHistory = entity.SpeedHistory.Slice()
 		}
 		enriched := pe.spectralCompiler.Compile(seq, speedHistory)
 		if !enriched.Valid {
-			// Not enough data for a full spectral frame yet.
-			// The entity still has its ring-buffer SpectralProfile which
-			// the attention engine will use.
 			slog.Debug("spectral frame not yet valid",
 				"vehicle", w.VehicleID,
-				"history_samples", len(speedHistory))
+				"history_len", len(speedHistory))
 		}
 
 		// Stage 5: Attention scoring.
-		// ScoreEntity reads entity.SpectralProfile.AnomalyScore (updated in
-		// Stage 3) and blends it with geometric relevance and salience.
+		// ScoreEntity blends geometric relevance, entity salience, and
+		// entity.SpectralProfile.AnomalyScore (updated in Stage 3).
 		score := pe.attentionEng.ScoreEntity(entity, clientState)
 
-		projections = append(projections, types.Projection{
+		// Build a Vehicle from entity state for the ranker. Anomaly flag
+		// enables the ranker's anomaly-priority promotion logic.
+		vehicles = append(vehicles, types.Vehicle{
 			ID:        entity.ID,
 			Lat:       entity.Position.Lat,
 			Lon:       entity.Position.Lon,
-			Score:     score,
 			Speed:     entity.Velocity.Speed,
 			Heading:   entity.Velocity.Heading,
-			Timestamp: entity.LastSeen.UnixNano(),
+			Timestamp: entity.LastSeen,
+			Anomaly:   entity.IsAnomalous(),
 		})
+		scores = append(scores, score)
 	}
 
-	// ── Stage 6: Ranker — top-K thinning ─────────────────────────────────────
-	return pe.rank.Rank(projections), nil
+	// ── Stage 6: Ranker — anomaly promotion + top-K thinning ─────────────────
+	scored := pe.rank.RankAndThin(vehicles, scores, pe.config.MaxVehiclesPerClient)
+	return pe.rank.ToProjections(scored), nil
 }
 
-// GetMemoryStore returns the engine's MemoryStore, used by the traffic API
-// layer and diagnostics.
+// GetMemoryStore returns the engine's MemoryStore for use by the traffic API
+// and diagnostics layers.
 func (pe *ProjectionEngine) GetMemoryStore() *memory.MemoryStore {
 	return pe.memoryStore
 }
 
-// GetWindowStats returns active and finalized window counts.
+// GetWindowStats returns the current count of active and finalized windows.
 func (pe *ProjectionEngine) GetWindowStats() (active, finalized int) {
 	return pe.windowing.Stats()
 }
 
-// Reset clears transient engine state (windowing buffers, memory store).
+// Reset clears transient state (windowing buffers, memory store).
 // The spectral compiler is stateless and does not need resetting.
 func (pe *ProjectionEngine) Reset() {
 	if pe.windowing != nil {
@@ -235,7 +237,7 @@ func (pe *ProjectionEngine) Reset() {
 	}
 }
 
-// Stop shuts down background goroutines (memory decay loop, etc.).
+// Stop shuts down background goroutines (memory decay loop).
 func (pe *ProjectionEngine) Stop() {
 	if pe.memoryStore != nil {
 		pe.memoryStore.Stop()

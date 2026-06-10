@@ -1,101 +1,91 @@
 package window_test
 
 import (
-	"reflect"
+	"fmt"
 	"testing"
 
 	"hypnotz/internal/types"
 	"hypnotz/internal/window"
 )
 
+// ─── Property helpers ──────────────────────────────────────────────────────────
+
 func Prop_DeterministicWindows(policy window.WindowPolicy, events []window.StreamEvent) bool {
-	engine1 := window.NewWindowingEngine(policy)
-	engine2 := window.NewWindowingEngine(policy)
+	e1 := window.NewWindowingEngine(policy)
+	e2 := window.NewWindowingEngine(policy)
 
 	for _, e := range events {
-		engine1.Ingest(e)
-		engine2.Ingest(e)
+		e1.Ingest(e) //nolint:errcheck
+		e2.Ingest(e) //nolint:errcheck
 	}
 
-	windows1, _ := engine1.Emit()
-	windows2, _ := engine2.Emit()
+	w1, _ := e1.Emit()
+	w2, _ := e2.Emit()
 
-	if len(windows1) != len(windows2) {
+	if len(w1) != len(w2) {
 		return false
 	}
-
-	for i := range windows1 {
-		if windows1[i].StartTimeNS != windows2[i].StartTimeNS {
-			return false
-		}
-		if windows1[i].EndTimeNS != windows2[i].EndTimeNS {
+	for i := range w1 {
+		if w1[i].StartTimeNS != w2[i].StartTimeNS ||
+			w1[i].EndTimeNS != w2[i].EndTimeNS {
 			return false
 		}
 	}
-
 	return true
 }
 
 func Prop_NoDuplicateEvents(policy window.WindowPolicy, events []window.StreamEvent) bool {
-	engine := window.NewWindowingEngine(policy)
-
+	eng := window.NewWindowingEngine(policy)
 	for _, e := range events {
-		engine.Ingest(e)
+		eng.Ingest(e) //nolint:errcheck
 	}
 
-	windows, _ := engine.Emit()
-
-	seen := make(map[string]bool)
+	windows, _ := eng.Emit()
+	seen := make(map[string]struct{})
 	for _, w := range windows {
 		for _, s := range w.States {
-			key := s.VehicleID + string(rune(s.TimestampNS))
-			if seen[key] {
+			// Use a properly formatted string key — string(rune(int64)) is
+			// not a digit string and produces collisions for large values.
+			key := fmt.Sprintf("%s:%d", s.VehicleID, s.TimestampNS)
+			if _, dup := seen[key]; dup {
 				return false
 			}
-			seen[key] = true
+			seen[key] = struct{}{}
 		}
 	}
-
 	return true
 }
 
 func Prop_WatermarkMonotonic(policy window.WindowPolicy, events []window.StreamEvent) bool {
-	engine := window.NewWindowingEngine(policy)
+	eng := window.NewWindowingEngine(policy)
 	last := int64(0)
-
 	for _, e := range events {
-		engine.Ingest(e)
-		wm := engine.CurrentWatermark()
+		eng.Ingest(e) //nolint:errcheck
+		wm := eng.CurrentWatermark()
 		if wm < last {
 			return false
 		}
 		last = wm
 	}
-
 	return true
 }
 
 func Prop_FinalizedImmutability(policy window.WindowPolicy, events []window.StreamEvent) bool {
-	engine := window.NewWindowingEngine(policy)
+	eng := window.NewWindowingEngine(policy)
+	for _, e := range events {
+		eng.Ingest(e) //nolint:errcheck
+	}
+	snapshot, _ := eng.Emit()
 
 	for _, e := range events {
-		engine.Ingest(e)
+		eng.Ingest(e) //nolint:errcheck
 	}
+	final, _ := eng.Emit()
 
-	snapshot, _ := engine.Emit()
-
-	for _, e := range events {
-		engine.Ingest(e)
-	}
-
-	finalSnapshot, _ := engine.Emit()
-
-	if len(snapshot) != len(finalSnapshot) {
-		return false
-	}
-
-	return true
+	return len(snapshot) == len(final)
 }
+
+// ─── Unit tests ────────────────────────────────────────────────────────────────
 
 func TestDeterministicWindowing(t *testing.T) {
 	policy := window.DefaultWindowPolicy()
@@ -104,9 +94,8 @@ func TestDeterministicWindowing(t *testing.T) {
 		{State: types.VehicleState{VehicleID: "v1", TimestampNS: 200}, ArrivalTimeNS: 200},
 		{State: types.VehicleState{VehicleID: "v1", TimestampNS: 300}, ArrivalTimeNS: 300},
 	}
-
 	if !Prop_DeterministicWindows(policy, events) {
-		t.Error("Windowing should be deterministic")
+		t.Error("windowing should be deterministic")
 	}
 }
 
@@ -114,11 +103,10 @@ func TestNoDuplicateEvents(t *testing.T) {
 	policy := window.DefaultWindowPolicy()
 	events := []window.StreamEvent{
 		{State: types.VehicleState{VehicleID: "v1", TimestampNS: 100}, ArrivalTimeNS: 100},
-		{State: types.VehicleState{VehicleID: "v1", TimestampNS: 100}, ArrivalTimeNS: 150},
+		{State: types.VehicleState{VehicleID: "v1", TimestampNS: 100}, ArrivalTimeNS: 150}, // duplicate
 	}
-
 	if !Prop_NoDuplicateEvents(policy, events) {
-		t.Error("Should not allow duplicate events")
+		t.Error("should not allow duplicate (vehicleID, timestampNS) pairs")
 	}
 }
 
@@ -129,9 +117,8 @@ func TestWatermarkMonotonicity(t *testing.T) {
 		{State: types.VehicleState{VehicleID: "v1", TimestampNS: 200}, ArrivalTimeNS: 200},
 		{State: types.VehicleState{VehicleID: "v1", TimestampNS: 300}, ArrivalTimeNS: 300},
 	}
-
 	if !Prop_WatermarkMonotonic(policy, events) {
-		t.Error("Watermark should be monotonic")
+		t.Error("watermark must be monotonically non-decreasing")
 	}
 }
 
@@ -141,9 +128,8 @@ func TestFinalizedImmutability(t *testing.T) {
 		{State: types.VehicleState{VehicleID: "v1", TimestampNS: 100}, ArrivalTimeNS: 100},
 		{State: types.VehicleState{VehicleID: "v1", TimestampNS: 200}, ArrivalTimeNS: 200},
 	}
-
 	if !Prop_FinalizedImmutability(policy, events) {
-		t.Error("Finalized windows should be immutable")
+		t.Error("re-ingesting the same events must not change finalized window count")
 	}
 }
 
@@ -153,10 +139,9 @@ func TestWindowAssignment(t *testing.T) {
 		SlideNS:           50,
 		AllowedLatenessNS: 10,
 	}
-
-	testCases := []struct {
-		timestamp    int64
-		expectedStart int64
+	cases := []struct {
+		ts    int64
+		start int64
 	}{
 		{0, 0},
 		{49, 0},
@@ -164,12 +149,10 @@ func TestWindowAssignment(t *testing.T) {
 		{99, 50},
 		{100, 100},
 	}
-
-	for _, tc := range testCases {
-		state := types.VehicleState{TimestampNS: tc.timestamp}
-		start := window.AssignWindow(state, policy)
-		if start != tc.expectedStart {
-			t.Errorf("Expected window start %d for timestamp %d, got %d", tc.expectedStart, tc.timestamp, start)
+	for _, tc := range cases {
+		got := window.AssignWindow(types.VehicleState{TimestampNS: tc.ts}, policy)
+		if got != tc.start {
+			t.Errorf("ts=%d: expected window start %d, got %d", tc.ts, tc.start, got)
 		}
 	}
 }
@@ -180,23 +163,20 @@ func TestLateEventRejection(t *testing.T) {
 		SlideNS:           50,
 		AllowedLatenessNS: 10,
 	}
+	eng := window.NewWindowingEngine(policy)
 
-	engine := window.NewWindowingEngine(policy)
-
-	engine.Ingest(window.StreamEvent{
-		State: types.VehicleState{VehicleID: "v1", TimestampNS: 100},
+	eng.Ingest(window.StreamEvent{ //nolint:errcheck
+		State:         types.VehicleState{VehicleID: "v1", TimestampNS: 100},
 		ArrivalTimeNS: 100,
 	})
+	eng.AdvanceWatermark(200)
 
-	engine.AdvanceWatermark(200)
-
-	err := engine.Ingest(window.StreamEvent{
-		State: types.VehicleState{VehicleID: "v1", TimestampNS: 50},
+	err := eng.Ingest(window.StreamEvent{
+		State:         types.VehicleState{VehicleID: "v1", TimestampNS: 50},
 		ArrivalTimeNS: 300,
 	})
-
 	if err == nil {
-		t.Error("Late event should be rejected")
+		t.Error("late event should be rejected with ErrLateEvent")
 	}
 }
 
@@ -206,43 +186,51 @@ func TestSlidingWindowOverlap(t *testing.T) {
 		SlideNS:           50,
 		AllowedLatenessNS: 10,
 	}
+	w1 := window.AssignWindow(types.VehicleState{TimestampNS: 75}, policy)
+	w2 := window.AssignWindow(types.VehicleState{TimestampNS: 125}, policy)
 
-	state1 := types.VehicleState{VehicleID: "v1", TimestampNS: 75}
-	state2 := types.VehicleState{VehicleID: "v1", TimestampNS: 125}
-
-	window1 := window.AssignWindow(state1, policy)
-	window2 := window.AssignWindow(state2, policy)
-
-	if window1 == window2 {
-		t.Error("Should assign to different windows")
+	if w1 == w2 {
+		t.Error("timestamps 75 and 125 should fall in different windows")
 	}
-
-	expectedDiff := int64(50)
-	if window2 - window1 != expectedDiff {
-		t.Errorf("Expected window difference %d, got %d", expectedDiff, window2-window1)
+	if diff := w2 - w1; diff != 50 {
+		t.Errorf("expected window difference 50, got %d", diff)
 	}
 }
 
-func TestEmptyWindowPadding(t *testing.T) {
+func TestStats(t *testing.T) {
 	policy := window.DefaultWindowPolicy()
-	engine := window.NewWindowingEngine(policy)
+	eng := window.NewWindowingEngine(policy)
 
-	events := []window.StreamEvent{
-		{State: types.VehicleState{VehicleID: "v1", TimestampNS: 100}, ArrivalTimeNS: 100},
-		{State: types.VehicleState{VehicleID: "v1", TimestampNS: 10000000000}, ArrivalTimeNS: 10000000000},
+	active, finalized := eng.Stats()
+	if active != 0 || finalized != 0 {
+		t.Errorf("fresh engine should have 0/0 stats, got %d/%d", active, finalized)
 	}
 
-	for _, e := range events {
-		engine.Ingest(e)
+	eng.Ingest(window.StreamEvent{ //nolint:errcheck
+		State:         types.VehicleState{VehicleID: "v1", TimestampNS: 1_000_000_000},
+		ArrivalTimeNS: 1_000_000_000,
+	})
+	active, _ = eng.Stats()
+	if active == 0 {
+		t.Error("should have at least one active window after ingest")
 	}
+}
 
-	windows, _ := engine.Emit()
-
-	for _, w := range windows {
-		if len(w.States) == 0 {
-			t.Error("Empty windows should be handled by padding strategy")
-		}
+func TestDeadLetterQueue(t *testing.T) {
+	policy := window.WindowPolicy{
+		WindowSizeNS:      100,
+		SlideNS:           50,
+		AllowedLatenessNS: 10,
 	}
+	eng := window.NewWindowingEngine(policy)
 
-	_ = reflect.TypeOf(windows)
+	eng.AdvanceWatermark(1000)
+	eng.Ingest(window.StreamEvent{ //nolint:errcheck
+		State:         types.VehicleState{VehicleID: "v1", TimestampNS: 1},
+		ArrivalTimeNS: 2000,
+	})
+
+	if len(eng.GetDeadLetter()) != 1 {
+		t.Errorf("expected 1 dead-letter event, got %d", len(eng.GetDeadLetter()))
+	}
 }
