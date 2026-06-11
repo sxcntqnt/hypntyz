@@ -4,3 +4,4 @@ go-attention
 .env
 go.sum
 go.mod
+traffic.db*
