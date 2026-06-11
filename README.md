@@ -1,6 +1,10 @@
-# Projection Engine - Cognitive Realtime System with Traffic Modeling
+# hypntyz
 
-## Architecture Overview
+A real-time vehicle projection engine with persistent cognitive memory and traffic modelling. hypntyz ingests high-frequency GPS telemetry, runs it through a stateful cognitive pipeline, and streams scored, ranked vehicle projections to connected clients over Server-Sent Events. It is designed to handle tens of thousands of concurrent clients and hundreds of thousands of tracked vehicles on a single node.
+
+---
+
+## Architecture
 
 ```
 ┌─────────────────────────────────────────────────────────────┐
@@ -10,8 +14,8 @@
 └─────────────────────────────────────────────────────────────┘
                             ↓
 ┌─────────────────────────────────────────────────────────────┐
-│                  TICK LOOP (20Hz)                           │
-│  - Runs every 50ms                                          │
+│                  TICK LOOP (20 Hz)                          │
+│  - Runs every 50 ms                                         │
 │  - Fetches active clients                                   │
 │  - Triggers cognitive pipeline                              │
 └─────────────────────────────────────────────────────────────┘
@@ -38,7 +42,7 @@
 └─────────────────────────────────────────────────────────────┘
                             ↓
 ┌─────────────────────────────────────────────────────────────┐
-│           MEMORY ENGINE + TRAFFIC MODELING                  │
+│           MEMORY ENGINE + TRAFFIC MODELLING                 │
 │  ┌──────────────────────────────────────────────────────┐  │
 │  │  MemoryEntity with persistent state:                 │  │
 │  │  • Position, velocity, trajectory                    │  │
@@ -47,7 +51,7 @@
 │  │  • Attention history                                 │  │
 │  │  • Predictive state                                  │  │
 │  │                                                      │  │
-│  │  TRAFFIC MODELING (NEW!)                             │  │
+│  │  TRAFFIC MODELLING                                   │  │
 │  │  • TripLine crossing detection                       │  │
 │  │  • Speed sample generation                           │  │
 │  │  • Per-segment speed histograms                      │  │
@@ -55,16 +59,16 @@
 │  └──────────────────────────────────────────────────────┘  │
 │                                                             │
 │  Operations:                                                │
-│  • Upsert(event) → evolve entity state                     │
-│  • ProcessTrafficCrossing() → detect speed anomalies       │
-│  • Decay() → gradual salience fade                         │
-│  • Query(client) → retrieve relevant entities              │
-│  • GarbageCollect() → remove stale entities                │
+│  • Upsert(event)              → evolve entity state        │
+│  • ProcessTrafficCrossing()   → detect speed anomalies     │
+│  • Decay()                    → gradual salience fade      │
+│  • Query(client)              → retrieve relevant entities │
+│  • GarbageCollect()           → remove stale entities      │
 └─────────────────────────────────────────────────────────────┘
                             ↓
 ┌─────────────────────────────────────────────────────────────┐
 │              ATTENTION ENGINE                               │
-│  - Scores MemoryEntities (not raw vehicles!)                │
+│  - Scores MemoryEntities (not raw vehicles)                 │
 │  - Combines:                                                │
 │    • Geometric relevance (60%)                              │
 │    • Entity salience (40%)                                  │
@@ -85,70 +89,175 @@
 └─────────────────────────────────────────────────────────────┘
 ```
 
-## Key Innovation: Memory + Traffic System
+---
 
-### Before (Stateless)
+## Key innovation: memory + traffic cognition
+
+### Before (stateless)
+
 ```
 event → score → emit → discard
 ```
-Every tick recomputes from scratch. No continuity.
 
-### After (Cognitive + Traffic Modeling)
+Every tick recomputes from scratch. No continuity between observations.
+
+### After (cognitive + traffic modelling)
+
 ```
-event → memory.update() → traffic.crossing() → attention.query() → emit
-            ↓                      ↓
-    Persistent entity      Speed samples
-    Trajectory tracking    Histogram aggregation
-    Salience accumulation  Anomaly detection
-    Embedding evolution    Risk score boost
+event → memory.Upsert() → traffic.ProcessCrossing() → attention.Score() → emit
+              ↓                      ↓
+   Persistent entity          Speed samples
+   Trajectory tracking        Histogram aggregation
+   Salience accumulation      Anomaly detection
+   Embedding evolution        Risk score propagation
 ```
 
-## Traffic Modeling Details
+The engine now has **memory**, **attention**, and **traffic-aware cognition**.
 
-Inspired by the OpenTraffic traffic-engine (Java), but implemented **in-memory** and **real-time**:
+---
 
-### TripLine System
-- Virtual perpendicular lines across road segments
-- Entry (index=1) and Exit (index=2) pairs
-- Line-intersection math for crossing detection
-- Speed computed from crossing time delta
+## Package layout
 
-### Speed Histogram
-- Bucketed by hour-of-week (0-167) and speed bin (0-120 km/h)
-- Compact `uint16` packing: `bin = hour * 120 + speed_bin`
-- Running statistics: count, mean, stddev
-- Anomaly detection: deviation from expected speed
+```
+internal/
+├── types/              Shared wire types and constants
+│   ├── types.go        Viewport, ClientState, Vehicle, Projection, FeatureVector
+│   └── vehicle_state.go  VehicleState, TensorSequence, QueryRequest, SourceType
+│
+├── trafficmodel/       Pure traffic data types — no internal imports
+│   ├── tripline.go     TripLine, Crossing, SpeedSample, geo helpers
+│   └── histogram.go    SpeedHistogram (168 h × 120 speed bins)
+│
+├── memory/             In-process entity store
+│   ├── entity.go       MemoryEntity: kinematics, salience, traffic model
+│   ├── store.go        MemoryStore: concurrent map, decay loop, GC
+│   └── embedding.go    EmbeddingEngine: cosine similarity, clustering
+│
+├── compiler/           VehicleState[] → TensorSequence
+│   └── temporal_compiler.go
+│
+├── features/           Feature vector construction
+│   ├── builder.go      FeatureVector builder, Haversine distance
+│   └── vector.go       VectorPool / MatrixPool (sync.Pool wrappers)
+│
+├── sirtebasin/         Data layer adapter (Redis + ClickHouse)
+│   ├── merge_engine.go Merge, Resolve, Deduplicate, confidence scoring
+│   └── redis_client.go Redis client (QueryRedis, GetLatestState)
+│
+├── traffic/            Traffic API and persistence
+│   ├── api.go          8 HTTP endpoints + SSE anomaly stream
+│   ├── persistence.go  SQLite: speed_samples + anomalies tables
+│   └── spatial_index.go  H3 spatial index (resolution 9, ~0.1 km²)
+│
+├── attention/          Attention scoring engine
+├── window/             Windowing policy engine
+├── ranker/             Ranking and top-K thinning
+├── engine/             Tick loop orchestration
+├── stream/             SSE connection management
+├── server/             HTTP server wiring
+└── diagnostics/        Observability and segment coverage analysis
+```
 
-### MemoryEntity Integration
-```go
+### Import graph (no cycles)
+
+```
+stdlib
+  └── types
+        └── trafficmodel          ← zero internal imports
+              └── memory
+                    └── traffic   ← attention, ranker, engine, stream, server
+```
+
+`trafficmodel` is the deepest internal dependency. Keeping it import-free is what breaks the `memory ↔ traffic` cycle.
+
+---
+
+## Traffic modelling
+
+Inspired by the OpenTraffic traffic-engine, but implemented in-memory and real-time.
+
+### TripLine system
+
+Virtual perpendicular lines are placed across road segments. Each segment gets an entry line (index 1) and an exit line (index 2). When a vehicle's GPS track crosses both in order, a speed sample is computed from the time delta and the known distance between the lines.
+
+```
+segment start ──── [entry TripLine] ──────────── [exit TripLine] ──── segment end
+                         ↑                               ↑
+                   crossing.Time = t1             crossing.Time = t2
+                                    speed = dist / (t2 - t1)
+```
+
+Speed samples above 31 m/s (~111 km/h) are filtered as GPS artefacts.
+
+### Speed histogram
+
+Each `MemoryEntity` maintains a `SpeedHistogram` — a sparse `map[uint16]int64` packing `(hour_of_week × 120 + speed_bin)` into a single key. This gives 168 × 120 = 20,160 possible buckets covering a full week at 1 km/h resolution, with typical memory use under 10 KB per entity.
+
+### Anomaly detection flow
+
+```
 entity.ProcessTrafficCrossing(crossing)
   ↓
-SpeedSample generated
+SpeedSample computed (entry → exit pair matched)
   ↓
-Added to histogram
+Sample added to histogram
   ↓
-If speed > 1.5x expected OR < 0.5x expected:
-  RiskScore += 0.2
-  Salience += 0.1
+If speed > 1.5× expected OR speed < 0.5× expected:
+    RiskScore  += 0.2
   ↓
-Attention score boosted
+If deviation > 2σ from segment mean:
+    AnomalyReport broadcast to SSE subscribers
+    Event persisted to SQLite anomalies table
 ```
 
-## Configuration
+---
 
-```bash
-# Memory settings
-MAX_MEMORY_ENTITIES=100000
-MEMORY_ENTITY_TTL=30m
+## Traffic API
 
-# Traffic modeling
-MAX_SPEED=31.0 m/s  # Filter unrealistic speeds
-MIN_SEGMENT_LEN=60m  # Minimum segment length for trip lines
+| Method | Endpoint | Description |
+|--------|----------|-------------|
+| `GET` | `/traffic/segments/profile?segment_id=` | Speed histogram stats: mean, stddev, hourly averages |
+| `GET` | `/traffic/state` | Snapshot: active vehicles, anomalies, congestion level |
+| `GET` | `/traffic/coverage` | Observability: % observable / partial / dead zone |
+| `POST` | `/traffic/crossings` | Inject an external TripLine crossing event |
+| `GET` | `/traffic/stream/anomalies` | SSE stream of real-time anomaly alerts |
+| `GET` | `/traffic/h3/state?lat=&lon=` | Traffic state for the H3 hexagon at a coordinate |
+| `GET` | `/traffic/h3/boundary?lat=&lon=` | Hexagon boundary polygon for map rendering |
+| `GET` | `/traffic/h3/neighbors?lat=&lon=` | Six adjacent hexagons for congestion propagation |
 
-# Decay settings
-DECAY_RATE=0.995
-DECAY_INTERVAL=1s
-```
+### Congestion levels
+
+| Level | Threshold |
+|-------|-----------|
+| `LOW` | ≥ 25 m/s (~90 km/h) |
+| `MEDIUM` | 15–25 m/s (54–90 km/h) |
+| `HIGH` | < 15 m/s (~54 km/h) |
+| `UNKNOWN` | No speed data |
+
+---
+
+## Data sources
+
+| Source | Latency | Characteristic |
+|--------|---------|---------------|
+| Redis | sub-second | Live position stream, rolling window |
+| ClickHouse | seconds–minutes | Historical batch, higher trust once stable |
+| Merged | — | Reconciled output of both |
+
+**Resolution order** when two sources have the same timestamp:
+1. Newer `TimestampNS` wins outright.
+2. A ClickHouse record older than `stabilityThreshold` (default 5 min) beats Redis.
+3. Higher `IngestSeq` breaks remaining ties.
+
+**Confidence scoring** blends recency decay with a per-source bonus:
+
+| Source | Bonus |
+|--------|-------|
+| Redis | +0.15 |
+| ClickHouse | +0.10 |
+| Merged | +0.05 |
+
+---
 
 ## API
 
@@ -157,7 +266,7 @@ DECAY_INTERVAL=1s
 curl http://localhost:8080/health
 ```
 
-### Stats (includes memory + traffic metrics)
+### Stats
 ```bash
 curl http://localhost:8080/stats
 # {
@@ -166,8 +275,7 @@ curl http://localhost:8080/stats
 #   "memory_active": 987,
 #   "memory_stale": 12,
 #   "traffic_samples": 5678,
-#   "anomalies_detected": 23,
-#   ...
+#   "anomalies_detected": 23
 # }
 ```
 
@@ -175,8 +283,9 @@ curl http://localhost:8080/stats
 ```bash
 POST /subscribe?client_id=abc123
 {
-  "viewport": { "min_lat": ..., "max_lat": ..., ... },
-  "focus": { "lat": ..., "lon": ... },
+  "viewport": { "min_lat": -1.30, "max_lat": -1.28, "min_lon": 36.81, "max_lon": 36.84 },
+  "focus_lat": -1.292,
+  "focus_lon": 36.821,
   "preferences": { "anomaly_priority": true },
   "max_results": 300
 }
@@ -186,10 +295,21 @@ POST /subscribe?client_id=abc123
 ```javascript
 const es = new EventSource("http://localhost:8080/stream?client_id=abc123");
 es.onmessage = (event) => {
-  const data = JSON.parse(event.data);
-  renderVehicles(data.vehicles);
+  const { vehicles } = JSON.parse(event.data);
+  renderVehicles(vehicles);
 };
 ```
+
+### Anomaly stream
+```javascript
+const es = new EventSource("http://localhost:8080/traffic/stream/anomalies");
+es.onmessage = (event) => {
+  const anomaly = JSON.parse(event.data);
+  console.log(anomaly.vehicle_id, "speed:", anomaly.speed_ms, "σ:", anomaly.deviation_std);
+};
+```
+
+---
 
 ## Running
 
@@ -197,49 +317,97 @@ es.onmessage = (event) => {
 # Development
 go run ./main.go
 
-# Production
-go build -o projection-engine .
-./projection-engine
+# Production build
+go build -o hypntyz .
+./hypntyz
 ```
+
+### Configuration
+
+`types.ClientConfig` controls the key tunables. `SirtebasinURL` and `RedisURL` have no defaults and must be set before the engine starts.
+
+| Field | Default | Description |
+|-------|---------|-------------|
+| `TickRateHz` | 20 | Pipeline tick rate |
+| `MaxVehiclesPerClient` | 500 | Top-K cap per SSE stream |
+| `MaxClientsPerNode` | 10,000 | Concurrent SSE connections |
+| `EnableBackpressure` | true | Drop slow clients rather than stall the pipeline |
+| `RegionID` | `"default"` | Node identity for multi-region deployments |
+
+Memory and decay tunables live in `memory.MemoryConfig`:
+
+| Field | Default | Description |
+|-------|---------|-------------|
+| `MaxEntities` | 100,000 | Hard cap on tracked vehicles |
+| `EntityTTL` | 30 min | Eviction threshold for unseen entities |
+| `DecayInterval` | 1 s | How often the salience decay loop runs |
+| `DecayRate` | 0.995 | Per-second salience multiplier |
+
+---
 
 ## Tests
 
 ```bash
 go test ./... -v
-# ✓ Memory entity creation/apply/decay
-# ✓ Store upsert/query/decay
-# ✓ Embedding generation
-# ✓ Garbage collection
-# ✓ Window determinism
-# ✓ Compiler invariants
-# ✓ Traffic trip line crossing
-# ✓ Speed histogram binning
+
+# ✓ Memory entity creation / apply / decay
+# ✓ Store upsert / query / decay / GC
+# ✓ Embedding generation and similarity
+# ✓ Compiler determinism and feature dimensions
+# ✓ Compiler timestamp ordering invariant
+# ✓ Source encoding passthrough
+# ✓ TripLine crossing detection
+# ✓ Speed computation from crossing pair
+# ✓ Histogram binning and statistics
 # ✓ Speed deviation detection
 ```
 
-## Architecture Properties
+---
+
+## Persistence
+
+SQLite (`traffic.db`) is created in the working directory on first run. WAL mode is enabled; the `-wal` and `-shm` sibling files are normal and safe to ignore.
+
+| Table | Contents |
+|-------|----------|
+| `speed_samples` | Histogram bins keyed by `(segment_id, hour_of_week, speed_bin)` |
+| `anomalies` | Timestamped events with vehicle, segment, speed, deviation, risk score |
+
+---
+
+## Architecture properties
 
 | Property | Implementation |
 |----------|----------------|
-| **Deterministic ordering** | Timestamp dominance in merge engine |
-| **Replay safety** | Windowing + watermark invariants |
-| **Memory persistence** | Entity state evolves, not recomputed |
-| **Attention over memory** | Scores entities, not raw vehicles |
-| **Predictive cognition** | Trajectory + embedding evolution |
-| **Traffic modeling** | TripLine crossing + speed histograms |
-| **Scalability** | O(events × mutations) not O(clients × vehicles × ticks) |
+| Deterministic ordering | Timestamp dominance in merge engine |
+| Replay safety | Windowing + watermark invariants |
+| Memory persistence | Entity state evolves across ticks, not recomputed |
+| Attention over memory | Scores entities, not raw vehicle events |
+| Predictive cognition | Trajectory extrapolation + embedding evolution |
+| Traffic modelling | TripLine crossings + per-segment speed histograms |
+| Scalability | O(events × mutations), not O(clients × vehicles × ticks) |
 
-## Mental Model
+---
 
-This is no longer a **traffic streaming system**.
+## Deployment notes
 
-This is a **persistent realtime cognition engine** that:
+- H3 spatial index requires CGO (`gcc` or `clang`). Cross-compile with `CGO_ENABLED=1`.
+- H3 resolution 9 gives ~0.1 km² hexagons. Memory footprint is approximately 100 MB for 1 M vehicles at this resolution.
+- SQLite is appropriate for single-node deployments. For multi-node, replace `Persistor` with a shared store (Postgres, TiKV, etc.).
+- The Redis client in `sirtebasin/redis_client.go` is currently a stub. Wire in `github.com/redis/go-redis/v9` and implement `XRANGE`/`XREVRANGE` to activate real-time ingestion.
+
+---
+
+## Mental model
+
+This is not a traffic streaming system.
+
+This is a **persistent real-time cognition engine** that:
+
 - Remembers vehicles across observations
-- Accumulates anomaly evidence
+- Accumulates anomaly evidence over time
 - Learns trajectory patterns
-- Maintains latent embeddings
+- Maintains latent embeddings per entity
 - Decays irrelevant memories
-- **Detects traffic anomalies in real-time**
-- Surfaces cognitively relevant entities
-
-The system now has **memory**, **attention**, and **traffic-aware cognition**.
+- Detects traffic anomalies in real-time
+- Surfaces the cognitively most relevant entities to each client
